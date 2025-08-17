@@ -17,12 +17,19 @@ export class CopilotAPIServer {
   private port: number
   private hostname: string
 
+  // Connection management
+  private activeStreams = new Set<string>()
+  private streamingRateLimit = new Map<string, number>()
+  private readonly MAX_CONCURRENT_STREAMS = parseInt(process.env.MAX_STREAMS || "100")
+  private readonly RATE_LIMIT_INTERVAL = 1000 // 1 second between streaming requests per client
+
   constructor(port: number = 8069, hostname: string = "127.0.0.1") {
     this.port = port
     this.hostname = hostname
     this.app = new Hono()
     this.setupMiddleware()
     this.setupRoutes()
+    this.setupConnectionMonitoring()
   }
 
   private setupMiddleware() {
@@ -183,20 +190,43 @@ export class CopilotAPIServer {
 
           // Handle streaming vs non-streaming requests
           if (body.stream) {
+            // Check rate limiting and connection limits
+            const clientId = this.getClientId(c)
+
+            if (!this.checkStreamingRateLimit(clientId)) {
+              const errorResponse: APIError = {
+                error: {
+                  message: "Rate limit exceeded. Please wait before making another streaming request.",
+                  type: "rate_limit_error",
+                  code: "rate_limit_exceeded"
+                }
+              }
+              return c.json(errorResponse, 429)
+            }
+
+            if (this.activeStreams.size >= this.MAX_CONCURRENT_STREAMS) {
+              const errorResponse: APIError = {
+                error: {
+                  message: "Server is at maximum capacity for streaming requests. Please try again later.",
+                  type: "capacity_error",
+                  code: "max_streams_exceeded"
+                }
+              }
+              return c.json(errorResponse, 503)
+            }
+
             // Use Hono's streamSSE for streaming responses
             return streamSSE(c, async (stream) => {
+              const streamId = `stream-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+              this.trackStream(streamId)
+
               try {
-                await this.forwardToCopilotStreaming(token, body, endpoint, stream)
+                await this.forwardToCopilotStreaming(token, body, endpoint, stream, streamId)
               } catch (error) {
                 console.error("Streaming error:", error)
-                await stream.writeSSE({
-                  data: JSON.stringify({
-                    error: {
-                      message: error instanceof Error ? error.message : "Streaming failed",
-                      type: "api_error"
-                    }
-                  })
-                })
+                await this.handleStreamingError(stream, error instanceof Error ? error : new Error("Streaming failed"), `endpoint-${streamId}`)
+              } finally {
+                this.untrackStream(streamId)
               }
             })
           } else {
@@ -385,21 +415,28 @@ export class CopilotAPIServer {
     token: string,
     request: ChatCompletionRequest,
     endpoint: string,
-    stream: any
+    stream: any,
+    streamId: string
   ): Promise<void> {
-    // Helper function to safely include stop parameter
-    const safeStopParam = (stop?: string | string[]) => {
-      if (stop === null || stop === undefined) {
-        return {} // Omit the parameter entirely
+    console.log(`🔄 Starting streaming request ${streamId}`)
+
+    // Set up timeout for the entire streaming request
+    const streamTimeout = this.setupStreamTimeout(stream, streamId, 300000) // 5 minutes
+
+    try {
+      // Helper function to safely include stop parameter
+      const safeStopParam = (stop?: string | string[]) => {
+        if (stop === null || stop === undefined) {
+          return {} // Omit the parameter entirely
+        }
+        if (typeof stop === 'string' && stop.length > 0) {
+          return { stop }
+        }
+        if (Array.isArray(stop) && stop.length > 0) {
+          return { stop }
+        }
+        return {} // Omit if empty string or empty array
       }
-      if (typeof stop === 'string' && stop.length > 0) {
-        return { stop }
-      }
-      if (Array.isArray(stop) && stop.length > 0) {
-        return { stop }
-      }
-      return {} // Omit if empty string or empty array
-    }
 
     const requestBody = {
       model: request.model,
@@ -442,7 +479,9 @@ export class CopilotAPIServer {
 
         if (response.ok) {
           console.log(`✅ Success with streaming endpoint: ${apiUrl}`)
-          await this.processStreamingResponse(response, stream, request)
+          await this.processStreamingResponse(response, stream, request, streamId)
+          clearTimeout(streamTimeout)
+          console.log(`🎉 Streaming request ${streamId} completed successfully`)
           return
         } else if (response.status === 404) {
           console.log(`❌ 404 for streaming endpoint: ${apiUrl}, trying next...`)
@@ -462,13 +501,23 @@ export class CopilotAPIServer {
     }
 
     // If we get here, all endpoints failed
-    throw lastError || new Error("All Copilot endpoints failed for streaming request")
+    clearTimeout(streamTimeout)
+    const finalError = lastError || new Error("All Copilot endpoints failed for streaming request")
+    await this.handleStreamingError(stream, finalError, `streaming-${streamId}`)
+    throw finalError
+    } catch (error) {
+      clearTimeout(streamTimeout)
+      const streamError = error instanceof Error ? error : new Error("Unknown streaming error")
+      await this.handleStreamingError(stream, streamError, `streaming-${streamId}`)
+      throw streamError
+    }
   }
 
   private async processStreamingResponse(
     response: Response,
     stream: any,
-    request: ChatCompletionRequest
+    request: ChatCompletionRequest,
+    streamId: string
   ): Promise<void> {
     const reader = response.body?.getReader()
     if (!reader) {
@@ -477,18 +526,42 @@ export class CopilotAPIServer {
 
     const decoder = new TextDecoder()
     let buffer = ""
+    let chunkCount = 0
+    let lastActivityTime = Date.now()
+    const CHUNK_TIMEOUT = 30000 // 30 seconds between chunks
 
     // Handle client abort
+    let isAborted = false
     stream.onAbort(() => {
-      console.log('Client aborted streaming request')
+      console.log(`🚫 Client aborted streaming request ${streamId}`)
+      isAborted = true
       reader.releaseLock()
     })
 
+    // Set up chunk timeout monitoring
+    const chunkTimeoutInterval = setInterval(() => {
+      if (Date.now() - lastActivityTime > CHUNK_TIMEOUT) {
+        console.warn(`⏰ Chunk timeout for stream ${streamId}, last activity: ${Date.now() - lastActivityTime}ms ago`)
+        clearInterval(chunkTimeoutInterval)
+        reader.releaseLock()
+        throw new Error("Streaming chunk timeout - no data received for 30 seconds")
+      }
+    }, 5000) // Check every 5 seconds
+
     try {
       while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
+        if (isAborted) {
+          console.log(`🚫 Stream ${streamId} was aborted, stopping processing`)
+          break
+        }
 
+        const { done, value } = await reader.read()
+        if (done) {
+          console.log(`📡 Stream ${streamId} completed, processed ${chunkCount} chunks`)
+          break
+        }
+
+        lastActivityTime = Date.now()
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
         buffer = lines.pop() || ""
@@ -498,6 +571,7 @@ export class CopilotAPIServer {
             const data = line.slice(6).trim()
             if (data === '[DONE]') {
               await stream.writeSSE({ data: '[DONE]' })
+              console.log(`✅ Stream ${streamId} finished with [DONE] signal`)
               return
             }
 
@@ -507,14 +581,27 @@ export class CopilotAPIServer {
               await stream.writeSSE({
                 data: JSON.stringify(transformedChunk)
               })
+              chunkCount++
+
+              // Log progress every 10 chunks
+              if (chunkCount % 10 === 0) {
+                console.log(`📊 Stream ${streamId}: ${chunkCount} chunks processed`)
+              }
             } catch (parseError) {
-              console.warn("Failed to parse streaming chunk:", parseError)
+              console.warn(`⚠️ Failed to parse streaming chunk in ${streamId}:`, parseError)
+              // Continue processing other chunks instead of failing completely
             }
           }
         }
       }
+    } catch (error) {
+      console.error(`❌ Error processing stream ${streamId}:`, error)
+      throw error
     } finally {
-      reader.releaseLock()
+      clearInterval(chunkTimeoutInterval)
+      if (!isAborted) {
+        reader.releaseLock()
+      }
     }
   }
 
@@ -543,6 +630,119 @@ export class CopilotAPIServer {
       }],
       usage: copilotChunk.usage,
     }
+  }
+
+  /**
+   * Handle streaming errors by sending error chunk to client
+   */
+  private async handleStreamingError(
+    stream: any,
+    error: Error,
+    context: string
+  ): Promise<void> {
+    console.error(`💥 Streaming error in ${context}:`, error.message)
+
+    const errorChunk: ChatCompletionStreamChunk = {
+      id: `chatcmpl-error-${Date.now()}`,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: "error",
+      choices: [{
+        index: 0,
+        delta: {},
+        finish_reason: "error",
+      }],
+    }
+
+    try {
+      await stream.writeSSE({
+        data: JSON.stringify({
+          error: {
+            message: error.message,
+            type: "stream_error",
+            code: "streaming_failed"
+          }
+        })
+      })
+
+      // Send [DONE] to properly close the stream
+      await stream.writeSSE({ data: '[DONE]' })
+    } catch (writeError) {
+      console.error(`💥 Failed to write error to stream in ${context}:`, writeError)
+    }
+  }
+
+  /**
+   * Set up timeout for streaming requests
+   */
+  private setupStreamTimeout(stream: any, streamId: string, timeoutMs: number = 300000): NodeJS.Timeout {
+    return setTimeout(async () => {
+      console.warn(`⏰ Stream timeout for ${streamId} after ${timeoutMs}ms`)
+      await this.handleStreamingError(
+        stream,
+        new Error(`Stream timeout after ${timeoutMs / 1000} seconds`),
+        `timeout-${streamId}`
+      )
+    }, timeoutMs)
+  }
+
+  /**
+   * Set up connection monitoring
+   */
+  private setupConnectionMonitoring(): void {
+    // Monitor active streams every minute
+    setInterval(() => {
+      console.log(`📊 Active streams: ${this.activeStreams.size}/${this.MAX_CONCURRENT_STREAMS}`)
+
+      // Clean up old rate limit entries (older than 5 minutes)
+      const fiveMinutesAgo = Date.now() - 300000
+      for (const [clientId, timestamp] of this.streamingRateLimit.entries()) {
+        if (timestamp < fiveMinutesAgo) {
+          this.streamingRateLimit.delete(clientId)
+        }
+      }
+    }, 60000) // Every minute
+  }
+
+  /**
+   * Get client identifier for rate limiting
+   */
+  private getClientId(c: any): string {
+    // Use IP address as client identifier
+    const forwarded = c.req.header('x-forwarded-for')
+    const ip = forwarded ? forwarded.split(',')[0] : c.req.header('x-real-ip') || 'unknown'
+    return ip
+  }
+
+  /**
+   * Check streaming rate limit for a client
+   */
+  private checkStreamingRateLimit(clientId: string): boolean {
+    const now = Date.now()
+    const lastRequest = this.streamingRateLimit.get(clientId) || 0
+
+    if (now - lastRequest < this.RATE_LIMIT_INTERVAL) {
+      return false
+    }
+
+    this.streamingRateLimit.set(clientId, now)
+    return true
+  }
+
+  /**
+   * Track an active streaming connection
+   */
+  private trackStream(streamId: string): void {
+    this.activeStreams.add(streamId)
+    console.log(`📈 Stream ${streamId} started. Active: ${this.activeStreams.size}/${this.MAX_CONCURRENT_STREAMS}`)
+  }
+
+  /**
+   * Untrack a streaming connection
+   */
+  private untrackStream(streamId: string): void {
+    this.activeStreams.delete(streamId)
+    console.log(`📉 Stream ${streamId} ended. Active: ${this.activeStreams.size}/${this.MAX_CONCURRENT_STREAMS}`)
   }
 
   /**
