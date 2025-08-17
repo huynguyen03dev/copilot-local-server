@@ -47,6 +47,9 @@ export const ChatCompletionRequest = z.object({
   temperature: z.number().optional(),
   max_tokens: z.number().optional(),
   stream: z.boolean().optional(),
+  stream_options: z.object({
+    include_usage: z.boolean().optional(),
+  }).optional(),
   top_p: z.number().optional(),
   stop: z.union([z.string(), z.array(z.string())]).optional(),
 })
@@ -71,6 +74,32 @@ export const ChatCompletionResponse = z.object({
 export type ChatCompletionRequest = z.infer<typeof ChatCompletionRequest>
 export type ChatCompletionResponse = z.infer<typeof ChatCompletionResponse>
 export type ChatMessage = z.infer<typeof ChatMessage>
+
+// Streaming-specific types
+export const DeltaMessage = z.object({
+  role: z.enum(["system", "user", "assistant"]).optional(),
+  content: z.string().optional(),
+})
+
+export const ChatCompletionStreamChunk = z.object({
+  id: z.string(),
+  object: z.literal("chat.completion.chunk"),
+  created: z.number(),
+  model: z.string(),
+  choices: z.array(z.object({
+    index: z.number(),
+    delta: DeltaMessage,
+    finish_reason: z.string().nullable(),
+  })),
+  usage: z.object({
+    prompt_tokens: z.number(),
+    completion_tokens: z.number(),
+    total_tokens: z.number(),
+  }).optional(),
+})
+
+export type DeltaMessage = z.infer<typeof DeltaMessage>
+export type ChatCompletionStreamChunk = z.infer<typeof ChatCompletionStreamChunk>
 
 // Error Types
 export interface APIError {

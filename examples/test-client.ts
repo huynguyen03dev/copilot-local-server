@@ -19,6 +19,7 @@ interface ChatCompletionRequest {
   messages: ChatMessage[]
   temperature?: number
   max_tokens?: number
+  stream?: boolean
 }
 
 interface ChatCompletionResponse {
@@ -30,6 +31,26 @@ interface ChatCompletionResponse {
     index: number
     message: ChatMessage
     finish_reason: string
+  }>
+  usage?: {
+    prompt_tokens: number
+    completion_tokens: number
+    total_tokens: number
+  }
+}
+
+interface ChatCompletionStreamChunk {
+  id: string
+  object: "chat.completion.chunk"
+  created: number
+  model: string
+  choices: Array<{
+    index: number
+    delta: {
+      role?: "system" | "user" | "assistant"
+      content?: string
+    }
+    finish_reason: string | null
   }>
   usage?: {
     prompt_tokens: number
@@ -118,6 +139,59 @@ class CopilotAPIClient {
     }
 
     return response.json()
+  }
+
+  async *chatCompletionStream(request: ChatCompletionRequest): AsyncGenerator<ChatCompletionStreamChunk, void, unknown> {
+    const streamRequest = { ...request, stream: true }
+    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(streamRequest),
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new Error(`Streaming chat completion failed: ${response.status} - ${errorText}`)
+    }
+
+    const reader = response.body?.getReader()
+    if (!reader) {
+      throw new Error("No response body reader available")
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ""
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ""
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6).trim()
+            if (data === '[DONE]') {
+              return
+            }
+
+            try {
+              const chunk: ChatCompletionStreamChunk = JSON.parse(data)
+              yield chunk
+            } catch (parseError) {
+              console.warn("Failed to parse streaming chunk:", parseError)
+            }
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
   }
 }
 
@@ -248,7 +322,61 @@ async function main() {
     }
 
     console.log()
-    console.log("🎉 All tests passed!")
+
+    // 5. Test streaming chat completion
+    console.log("5️⃣ Testing streaming chat completion...")
+    const streamingMessage = "Count to 5 slowly, with a comma between each number"
+
+    const streamingRequest: ChatCompletionRequest = {
+      model: "gpt-4",
+      messages: [
+        {
+          role: "system",
+          content: "You are a helpful AI assistant. Be concise and follow instructions exactly."
+        },
+        {
+          role: "user",
+          content: streamingMessage
+        }
+      ],
+      temperature: 0.7,
+      max_tokens: 50
+    }
+
+    console.log(`   💬 Streaming message: "${streamingMessage}"`)
+    console.log("   📡 Receiving streaming response...")
+    console.log("   ⏳ Response chunks:")
+
+    const streamStartTime = Date.now()
+    let collectedContent = ""
+    let chunkCount = 0
+
+    try {
+      for await (const chunk of client.chatCompletionStream(streamingRequest)) {
+        chunkCount++
+        if (chunk.choices && chunk.choices.length > 0 && chunk.choices[0].delta.content) {
+          const content = chunk.choices[0].delta.content
+          collectedContent += content
+          process.stdout.write(content)
+        }
+      }
+
+      const streamDuration = Date.now() - streamStartTime
+      console.log()
+      console.log(`   ✅ Streaming completed in ${streamDuration}ms`)
+      console.log(`   📊 Received ${chunkCount} chunks`)
+      console.log()
+      console.log("📝 Complete Streamed Response:")
+      console.log("─".repeat(50))
+      console.log(collectedContent)
+      console.log("─".repeat(50))
+    } catch (streamError) {
+      console.log(`\n   ⚠️  Streaming test failed: ${streamError}`)
+      console.log("   (This is expected if GitHub Copilot doesn't support streaming)")
+    }
+
+    console.log()
+    console.log("🎉 All tests completed!")
 
   } catch (error) {
     console.error("❌ Test failed:", error)

@@ -120,26 +120,31 @@ async function handleClearAuth() {
 
 async function startServer() {
   // Check if authenticated
-  const isAuthenticated = await GitHubCopilotAuth.isAuthenticated()
-  
-  if (!isAuthenticated) {
-    console.log("⚠️  Not authenticated with GitHub Copilot")
-    console.log("Run with --auth flag to authenticate first:")
-    console.log(`bun run src/index.ts --auth\n`)
-  } else {
-    console.log("✅ Authenticated with GitHub Copilot")
+  try {
+    const isAuthenticated = await GitHubCopilotAuth.isAuthenticated()
+
+    if (!isAuthenticated) {
+      console.log("⚠️  Not authenticated with GitHub Copilot")
+      console.log("Run with --auth flag to authenticate first:")
+      console.log(`bun run src/index.ts --auth\n`)
+    } else {
+      console.log("✅ Authenticated with GitHub Copilot")
+    }
+  } catch (error) {
+    console.log("⚠️  Authentication check failed:", error)
+    console.log("Starting server anyway for testing...")
   }
-  
+
   // Start the server
   const server = new CopilotAPIServer(port, hostname)
   server.start()
-  
+
   // Handle graceful shutdown
   process.on("SIGINT", () => {
     console.log("\n👋 Shutting down server...")
     process.exit(0)
   })
-  
+
   process.on("SIGTERM", () => {
     console.log("\n👋 Shutting down server...")
     process.exit(0)

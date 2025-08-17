@@ -1,13 +1,15 @@
 import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { logger } from "hono/logger"
+import { streamSSE } from "hono/streaming"
 import { zValidator } from "@hono/zod-validator"
 import { GitHubCopilotAuth } from "./auth"
-import { 
-  ChatCompletionRequest, 
-  ChatCompletionResponse, 
+import {
+  ChatCompletionRequest,
+  ChatCompletionResponse,
+  ChatCompletionStreamChunk,
   APIError,
-  type ChatMessage 
+  type ChatMessage
 } from "./types"
 
 export class CopilotAPIServer {
@@ -179,9 +181,29 @@ export class CopilotAPIServer {
           // Get the dynamic Copilot endpoint
           const endpoint = await GitHubCopilotAuth.getCopilotEndpoint()
 
-          // Forward request to GitHub Copilot API
-          const copilotResponse = await this.forwardToCopilot(token, body, endpoint)
-          return c.json(copilotResponse)
+          // Handle streaming vs non-streaming requests
+          if (body.stream) {
+            // Use Hono's streamSSE for streaming responses
+            return streamSSE(c, async (stream) => {
+              try {
+                await this.forwardToCopilotStreaming(token, body, endpoint, stream)
+              } catch (error) {
+                console.error("Streaming error:", error)
+                await stream.writeSSE({
+                  data: JSON.stringify({
+                    error: {
+                      message: error instanceof Error ? error.message : "Streaming failed",
+                      type: "api_error"
+                    }
+                  })
+                })
+              }
+            })
+          } else {
+            // Forward request to GitHub Copilot API (non-streaming)
+            const copilotResponse = await this.forwardToCopilot(token, body, endpoint)
+            return c.json(copilotResponse)
+          }
         } catch (error) {
           console.error("Copilot API error:", error)
           const errorResponse: APIError = {
@@ -357,6 +379,170 @@ export class CopilotAPIServer {
     }
 
     return openAIResponse
+  }
+
+  private async forwardToCopilotStreaming(
+    token: string,
+    request: ChatCompletionRequest,
+    endpoint: string,
+    stream: any
+  ): Promise<void> {
+    // Helper function to safely include stop parameter
+    const safeStopParam = (stop?: string | string[]) => {
+      if (stop === null || stop === undefined) {
+        return {} // Omit the parameter entirely
+      }
+      if (typeof stop === 'string' && stop.length > 0) {
+        return { stop }
+      }
+      if (Array.isArray(stop) && stop.length > 0) {
+        return { stop }
+      }
+      return {} // Omit if empty string or empty array
+    }
+
+    const requestBody = {
+      model: request.model,
+      messages: request.messages,
+      temperature: request.temperature || 0.7,
+      max_tokens: request.max_tokens,
+      stream: true, // Enable streaming for Copilot
+      top_p: request.top_p,
+      ...safeStopParam(request.stop),
+    }
+
+    // Try multiple endpoint paths with different request formats
+    const endpointConfigs = [
+      { path: "/v1/chat/completions", format: 0 },           // Standard OpenAI format
+      { path: "/chat/completions", format: 0 },              // Without v1 prefix
+      { path: "/v1/chat/completions", format: 1 },           // OpenAI with intent
+      { path: "/v1/engines/copilot-codex/completions", format: 2 }, // Old Copilot format
+      { path: "/engines/copilot-codex/completions", format: 2 },    // Old format without v1
+      { path: "/completions", format: 2 },                   // Simple format
+    ]
+
+    let lastError: Error | null = null
+
+    for (const config of endpointConfigs) {
+      const apiUrl = `${endpoint}${config.path}`
+      console.log(`Trying streaming request to: ${apiUrl}`)
+
+      try {
+        const response = await fetch(apiUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${token}`,
+            "Content-Type": "application/json",
+            "User-Agent": "GitHubCopilotChat/0.26.7",
+            "Editor-Version": "vscode/1.99.3",
+            "Editor-Plugin-Version": "copilot-chat/0.26.7",
+          },
+          body: JSON.stringify(requestBody),
+        })
+
+        if (response.ok) {
+          console.log(`✅ Success with streaming endpoint: ${apiUrl}`)
+          await this.processStreamingResponse(response, stream, request)
+          return
+        } else if (response.status === 404) {
+          console.log(`❌ 404 for streaming endpoint: ${apiUrl}, trying next...`)
+          continue
+        } else {
+          // Non-404 error, log and continue
+          const errorText = await response.text()
+          console.log(`❌ ${response.status} for streaming endpoint: ${apiUrl} - ${errorText}`)
+          lastError = new Error(`HTTP ${response.status}: ${errorText}`)
+          continue
+        }
+      } catch (error) {
+        console.log(`❌ Network error for streaming endpoint: ${apiUrl}`)
+        lastError = error instanceof Error ? error : new Error("Unknown error")
+        continue
+      }
+    }
+
+    // If we get here, all endpoints failed
+    throw lastError || new Error("All Copilot endpoints failed for streaming request")
+  }
+
+  private async processStreamingResponse(
+    response: Response,
+    stream: any,
+    request: ChatCompletionRequest
+  ): Promise<void> {
+    const reader = response.body?.getReader()
+    if (!reader) {
+      throw new Error("No response body reader available")
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ""
+
+    // Handle client abort
+    stream.onAbort(() => {
+      console.log('Client aborted streaming request')
+      reader.releaseLock()
+    })
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ""
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6).trim()
+            if (data === '[DONE]') {
+              await stream.writeSSE({ data: '[DONE]' })
+              return
+            }
+
+            try {
+              const chunk = JSON.parse(data)
+              const transformedChunk = this.transformCopilotStreamChunk(chunk, request)
+              await stream.writeSSE({
+                data: JSON.stringify(transformedChunk)
+              })
+            } catch (parseError) {
+              console.warn("Failed to parse streaming chunk:", parseError)
+            }
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+  }
+
+  private transformCopilotStreamChunk(
+    copilotChunk: any,
+    request: ChatCompletionRequest
+  ): ChatCompletionStreamChunk {
+    return {
+      id: copilotChunk.id || `chatcmpl-${Date.now()}`,
+      object: "chat.completion.chunk",
+      created: copilotChunk.created || Math.floor(Date.now() / 1000),
+      model: request.model,
+      choices: copilotChunk.choices?.map((choice: any) => ({
+        index: choice.index || 0,
+        delta: {
+          role: choice.delta?.role,
+          content: choice.delta?.content,
+        },
+        finish_reason: choice.finish_reason,
+      })) || [{
+        index: 0,
+        delta: {
+          content: copilotChunk.content || "",
+        },
+        finish_reason: null,
+      }],
+      usage: copilotChunk.usage,
+    }
   }
 
   /**
