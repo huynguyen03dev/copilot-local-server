@@ -11,6 +11,11 @@ import {
   APIError,
   type ChatMessage
 } from "./types"
+import {
+  validateContent,
+  transformMessagesForCopilot,
+  getContentStats
+} from "./utils/content"
 
 export class CopilotAPIServer {
   private app: Hono
@@ -227,6 +232,28 @@ export class CopilotAPIServer {
       async (c) => {
         const body = c.req.valid("json")
 
+        // Validate content format for all messages
+        for (let i = 0; i < body.messages.length; i++) {
+          const message = body.messages[i]
+          const validation = validateContent(message.content)
+          if (!validation.isValid) {
+            const errorResponse: APIError = {
+              error: {
+                message: `Invalid content in message ${i}: ${validation.error}`,
+                type: "invalid_request_error",
+                code: "invalid_content_format"
+              }
+            }
+            return c.json(errorResponse, 400)
+          }
+
+          // Log content statistics for debugging
+          const stats = getContentStats(message.content)
+          if (stats.type === "array") {
+            console.log(`📝 Message ${i}: ${stats.textBlocks} text block(s), ${stats.imageBlocks} image(s), ${stats.totalLength} chars`)
+          }
+        }
+
         // Check authentication
         const token = await GitHubCopilotAuth.getAccessToken()
         if (!token) {
@@ -363,10 +390,14 @@ export class CopilotAPIServer {
       return {} // Omit if empty string or empty array
     }
 
+    // Transform messages to text-only format for GitHub Copilot compatibility
+    const transformedMessages = transformMessagesForCopilot(request.messages)
+    console.log(`🔄 Transformed ${request.messages.length} message(s) for Copilot compatibility`)
+
     // Transform request to Copilot format - try different formats
     const baseRequest = {
       model: request.model,
-      messages: request.messages,
+      messages: transformedMessages,
       temperature: request.temperature || 0.7,
       max_tokens: request.max_tokens,
       stream: false, // For now, we'll handle non-streaming only
@@ -383,8 +414,8 @@ export class CopilotAPIServer {
         n: 1,
       },
       {
-        // Legacy Copilot format
-        prompt: request.messages.map(m => `${m.role}: ${m.content}`).join('\n'),
+        // Legacy Copilot format - use transformed messages with text-only content
+        prompt: transformedMessages.map(m => `${m.role}: ${m.content}`).join('\n'),
         max_tokens: request.max_tokens || 150,
         temperature: request.temperature || 0.7,
         top_p: request.top_p || 1,
@@ -501,9 +532,13 @@ export class CopilotAPIServer {
         return {} // Omit if empty string or empty array
       }
 
+    // Transform messages to text-only format for GitHub Copilot compatibility
+    const transformedMessages = transformMessagesForCopilot(request.messages)
+    console.log(`🔄 Streaming: Transformed ${request.messages.length} message(s) for Copilot compatibility`)
+
     const requestBody = {
       model: request.model,
-      messages: request.messages,
+      messages: transformedMessages,
       temperature: request.temperature || 0.7,
       max_tokens: request.max_tokens,
       stream: true, // Enable streaming for Copilot

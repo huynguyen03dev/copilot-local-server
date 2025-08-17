@@ -35,10 +35,29 @@ export const OAuthInfo = z.object({
 
 export type OAuthInfo = z.infer<typeof OAuthInfo>
 
-// OpenAI Compatible API Types
+// OpenAI Compatible API Types - Content Block Types
+export const TextContent = z.object({
+  type: z.literal("text"),
+  text: z.string(),
+})
+
+export const ImageContent = z.object({
+  type: z.literal("image_url"),
+  image_url: z.object({
+    url: z.string(),
+    detail: z.enum(["low", "high", "auto"]).optional(),
+  }),
+})
+
+export const ContentBlock = z.union([TextContent, ImageContent])
+
+// Updated ChatMessage to support both string and array content formats
 export const ChatMessage = z.object({
   role: z.enum(["system", "user", "assistant"]),
-  content: z.string(),
+  content: z.union([
+    z.string(),                    // Legacy string format (backward compatibility)
+    z.array(ContentBlock)          // New array format (multi-modal support)
+  ]),
 })
 
 export const ChatCompletionRequest = z.object({
@@ -74,6 +93,9 @@ export const ChatCompletionResponse = z.object({
 export type ChatCompletionRequest = z.infer<typeof ChatCompletionRequest>
 export type ChatCompletionResponse = z.infer<typeof ChatCompletionResponse>
 export type ChatMessage = z.infer<typeof ChatMessage>
+export type TextContent = z.infer<typeof TextContent>
+export type ImageContent = z.infer<typeof ImageContent>
+export type ContentBlock = z.infer<typeof ContentBlock>
 
 // Streaming-specific types
 export const DeltaMessage = z.object({
