@@ -1,0 +1,163 @@
+#!/usr/bin/env bun
+
+import { CopilotAPIServer } from "./server"
+import { GitHubCopilotAuth } from "./auth"
+
+// Parse command line arguments
+const args = process.argv.slice(2)
+const portArg = args.find(arg => arg.startsWith("--port="))
+const hostArg = args.find(arg => arg.startsWith("--host="))
+const helpArg = args.includes("--help") || args.includes("-h")
+const authArg = args.includes("--auth")
+const clearAuthArg = args.includes("--clear-auth")
+
+if (helpArg) {
+  console.log(`
+GitHub Copilot API Server
+
+Usage: bun run src/index.ts [options]
+
+Options:
+  --port=<number>     Port to listen on (default: 8069)
+  --host=<string>     Hostname to bind to (default: 127.0.0.1)
+  --auth              Start interactive authentication flow
+  --clear-auth        Clear stored authentication
+  --help, -h          Show this help message
+
+Examples:
+  bun run src/index.ts                    # Start server on default port
+  bun run src/index.ts --port=8080        # Start server on port 8080
+  bun run src/index.ts --auth             # Authenticate with GitHub Copilot
+  bun run src/index.ts --clear-auth       # Clear authentication
+
+API Endpoints:
+  GET  /                                  # Health check
+  GET  /auth/status                       # Check authentication status
+  POST /auth/start                        # Start authentication flow
+  POST /auth/poll                         # Poll for authentication completion
+  POST /auth/clear                        # Clear authentication
+  POST /v1/chat/completions              # OpenAI-compatible chat endpoint
+  GET  /v1/models                        # List available models
+
+Authentication Flow:
+  1. Run: bun run auth (or bun run src/index.ts --auth)
+  2. Visit the provided GitHub URL (opens automatically if possible)
+  3. Enter the user code shown in the terminal
+  4. Wait for confirmation (up to 15 minutes)
+  5. Start the server: bun run start
+  6. Use the API with any OpenAI-compatible client
+
+Troubleshooting Authentication:
+  • If authentication fails: bun run clear-auth && bun run auth
+  • Check GitHub Copilot subscription is active
+  • Ensure stable internet connection
+  • Authentication expires after 15 minutes - retry if needed
+`)
+  process.exit(0)
+}
+
+const port = portArg ? parseInt(portArg.split("=")[1]) : 8069
+const hostname = hostArg ? hostArg.split("=")[1] : "127.0.0.1"
+
+async function handleAuth() {
+  try {
+    const result = await GitHubCopilotAuth.authenticateWithFlow()
+
+    if (result.success) {
+      console.log("\n🎉 Authentication completed successfully!")
+      console.log("You can now start the server with: bun run start")
+      process.exit(0)
+    } else {
+      console.log("\n❌ Authentication failed")
+      if (result.error) {
+        console.log(`   Error: ${result.error}`)
+      }
+      if (result.errorDescription) {
+        console.log(`   Details: ${result.errorDescription}`)
+      }
+
+      // Provide helpful suggestions based on error type
+      switch (result.error) {
+        case "expired":
+          console.log("\n💡 Suggestions:")
+          console.log("   • Run the auth command again to get a new code")
+          console.log("   • Make sure to complete authentication within the time limit")
+          break
+        case "access_denied":
+          console.log("\n💡 Suggestions:")
+          console.log("   • Run the auth command again")
+          console.log("   • Make sure to click 'Authorize' on the GitHub page")
+          console.log("   • Check that you have a valid GitHub Copilot subscription")
+          break
+        case "network_error":
+          console.log("\n💡 Suggestions:")
+          console.log("   • Check your internet connection")
+          console.log("   • Verify GitHub is accessible")
+          console.log("   • Try again in a few moments")
+          break
+        default:
+          console.log("\n💡 Suggestions:")
+          console.log("   • Try running: bun run clear-auth")
+          console.log("   • Then run: bun run auth")
+          console.log("   • Make sure you have a valid GitHub Copilot subscription")
+      }
+
+      process.exit(1)
+    }
+  } catch (error) {
+    console.error("❌ Failed to start authentication:", error)
+    console.log("\n💡 Try running: bun run clear-auth && bun run auth")
+    process.exit(1)
+  }
+}
+
+async function handleClearAuth() {
+  console.log("🧹 Clearing stored authentication...")
+  await GitHubCopilotAuth.clearAuth()
+  console.log("✅ Authentication cleared")
+  process.exit(0)
+}
+
+async function startServer() {
+  // Check if authenticated
+  const isAuthenticated = await GitHubCopilotAuth.isAuthenticated()
+  
+  if (!isAuthenticated) {
+    console.log("⚠️  Not authenticated with GitHub Copilot")
+    console.log("Run with --auth flag to authenticate first:")
+    console.log(`bun run src/index.ts --auth\n`)
+  } else {
+    console.log("✅ Authenticated with GitHub Copilot")
+  }
+  
+  // Start the server
+  const server = new CopilotAPIServer(port, hostname)
+  server.start()
+  
+  // Handle graceful shutdown
+  process.on("SIGINT", () => {
+    console.log("\n👋 Shutting down server...")
+    process.exit(0)
+  })
+  
+  process.on("SIGTERM", () => {
+    console.log("\n👋 Shutting down server...")
+    process.exit(0)
+  })
+}
+
+// Main execution
+async function main() {
+  if (clearAuthArg) {
+    await handleClearAuth()
+  } else if (authArg) {
+    await handleAuth()
+  } else {
+    await startServer()
+  }
+}
+
+main().catch((error) => {
+  console.error("💥 Fatal error:", error)
+  process.exit(1)
+})

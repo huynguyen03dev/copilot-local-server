@@ -1,0 +1,36 @@
+{
+  "name": "vscode-copilot-api-server",
+  "version": "1.0.0",
+  "description": "Local API server that exposes GitHub Copilot as OpenAI-compatible endpoint",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "type-check": "tsc --noEmit",
+    "test": "bun run examples/test-client.ts",
+    "test-endpoint": "bun run test-endpoint.ts",
+    "test-stop": "python test-stop-param.py",
+    "debug": "python debug-test.py",
+    "auth": "bun run src/index.ts --auth",
+    "clear-auth": "bun run src/index.ts --clear-auth"
+  },
+  "dependencies": {
+    "hono": "^4.6.3",
+    "zod": "^3.23.8",
+    "@hono/zod-validator": "^0.2.2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.2"
+  },
+  "keywords": [
+    "github-copilot",
+    "openai-api",
+    "local-server",
+    "vscode"
+  ],
+  "author": "",
+  "license": "MIT"
+}
