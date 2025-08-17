@@ -23,6 +23,26 @@ export class CopilotAPIServer {
   private readonly MAX_CONCURRENT_STREAMS = parseInt(process.env.MAX_STREAMS || "100")
   private readonly RATE_LIMIT_INTERVAL = 1000 // 1 second between streaming requests per client
 
+  // Performance monitoring
+  private streamMetrics = {
+    totalRequests: 0,
+    successfulStreams: 0,
+    failedStreams: 0,
+    totalChunks: 0,
+    totalBytes: 0,
+    averageStreamDuration: 0,
+    peakConcurrentStreams: 0,
+    startTime: Date.now()
+  }
+
+  // Memory management
+  private readonly MAX_BUFFER_SIZE = parseInt(process.env.MAX_BUFFER_SIZE || "1048576") // 1MB
+  private readonly MEMORY_CHECK_INTERVAL = 30000 // 30 seconds
+  private memoryMonitor: NodeJS.Timeout | null = null
+
+  // Server instance for graceful shutdown
+  private server: any = null
+
   constructor(port: number = 8069, hostname: string = "127.0.0.1") {
     this.port = port
     this.hostname = hostname
@@ -60,10 +80,46 @@ export class CopilotAPIServer {
   private setupRoutes() {
     // Health check endpoint
     this.app.get("/", (c) => {
-      return c.json({ 
-        status: "ok", 
+      return c.json({
+        status: "ok",
         message: "GitHub Copilot API Server",
         version: "1.0.0"
+      })
+    })
+
+    // Metrics endpoint for monitoring
+    this.app.get("/metrics", (c) => {
+      const uptime = Date.now() - this.streamMetrics.startTime
+      const uptimeHours = Math.round(uptime / (1000 * 60 * 60) * 100) / 100
+
+      return c.json({
+        uptime: {
+          milliseconds: uptime,
+          hours: uptimeHours,
+          human: this.formatUptime(uptime)
+        },
+        streams: {
+          active: this.activeStreams.size,
+          maxConcurrent: this.MAX_CONCURRENT_STREAMS,
+          peakConcurrent: this.streamMetrics.peakConcurrentStreams,
+          total: this.streamMetrics.totalRequests,
+          successful: this.streamMetrics.successfulStreams,
+          failed: this.streamMetrics.failedStreams,
+          successRate: this.getSuccessRate()
+        },
+        performance: {
+          totalChunks: this.streamMetrics.totalChunks,
+          totalBytes: this.streamMetrics.totalBytes,
+          averageStreamDuration: Math.round(this.streamMetrics.averageStreamDuration),
+          chunksPerSecond: Math.round(this.streamMetrics.totalChunks / (uptime / 1000)),
+          bytesPerSecond: Math.round(this.streamMetrics.totalBytes / (uptime / 1000))
+        },
+        memory: process.memoryUsage(),
+        rateLimiting: {
+          activeClients: this.streamingRateLimit.size,
+          intervalMs: this.RATE_LIMIT_INTERVAL
+        },
+        timestamp: new Date().toISOString()
       })
     })
 
@@ -218,12 +274,17 @@ export class CopilotAPIServer {
             // Use Hono's streamSSE for streaming responses
             return streamSSE(c, async (stream) => {
               const streamId = `stream-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+              const startTime = Date.now()
               this.trackStream(streamId)
 
               try {
                 await this.forwardToCopilotStreaming(token, body, endpoint, stream, streamId)
+                const duration = Date.now() - startTime
+                this.updateStreamMetrics(streamId, true, duration)
               } catch (error) {
                 console.error("Streaming error:", error)
+                const duration = Date.now() - startTime
+                this.updateStreamMetrics(streamId, false, duration)
                 await this.handleStreamingError(stream, error instanceof Error ? error : new Error("Streaming failed"), `endpoint-${streamId}`)
               } finally {
                 this.untrackStream(streamId)
@@ -578,10 +639,14 @@ export class CopilotAPIServer {
             try {
               const chunk = JSON.parse(data)
               const transformedChunk = this.transformCopilotStreamChunk(chunk, request)
-              await stream.writeSSE({
-                data: JSON.stringify(transformedChunk)
-              })
+              const chunkData = JSON.stringify(transformedChunk)
+
+              // Implement backpressure handling
+              await this.writeWithBackpressure(stream, chunkData, streamId)
+
               chunkCount++
+              this.streamMetrics.totalChunks++
+              this.streamMetrics.totalBytes += chunkData.length
 
               // Log progress every 10 chunks
               if (chunkCount % 10 === 0) {
@@ -692,7 +757,17 @@ export class CopilotAPIServer {
   private setupConnectionMonitoring(): void {
     // Monitor active streams every minute
     setInterval(() => {
-      console.log(`📊 Active streams: ${this.activeStreams.size}/${this.MAX_CONCURRENT_STREAMS}`)
+      const currentActive = this.activeStreams.size
+
+      // Update peak concurrent streams
+      if (currentActive > this.streamMetrics.peakConcurrentStreams) {
+        this.streamMetrics.peakConcurrentStreams = currentActive
+      }
+
+      console.log(`📊 Active streams: ${currentActive}/${this.MAX_CONCURRENT_STREAMS}`)
+      console.log(`📈 Peak concurrent: ${this.streamMetrics.peakConcurrentStreams}`)
+      console.log(`📊 Total requests: ${this.streamMetrics.totalRequests}`)
+      console.log(`✅ Success rate: ${this.getSuccessRate()}%`)
 
       // Clean up old rate limit entries (older than 5 minutes)
       const fiveMinutesAgo = Date.now() - 300000
@@ -702,6 +777,11 @@ export class CopilotAPIServer {
         }
       }
     }, 60000) // Every minute
+
+    // Set up memory monitoring
+    this.memoryMonitor = setInterval(() => {
+      this.checkMemoryUsage()
+    }, this.MEMORY_CHECK_INTERVAL)
   }
 
   /**
@@ -734,6 +814,7 @@ export class CopilotAPIServer {
    */
   private trackStream(streamId: string): void {
     this.activeStreams.add(streamId)
+    this.streamMetrics.totalRequests++
     console.log(`📈 Stream ${streamId} started. Active: ${this.activeStreams.size}/${this.MAX_CONCURRENT_STREAMS}`)
   }
 
@@ -743,6 +824,109 @@ export class CopilotAPIServer {
   private untrackStream(streamId: string): void {
     this.activeStreams.delete(streamId)
     console.log(`📉 Stream ${streamId} ended. Active: ${this.activeStreams.size}/${this.MAX_CONCURRENT_STREAMS}`)
+  }
+
+  /**
+   * Write with backpressure handling
+   */
+  private async writeWithBackpressure(
+    stream: any,
+    data: string,
+    streamId: string
+  ): Promise<void> {
+    // Check if data size exceeds buffer limit
+    if (data.length > this.MAX_BUFFER_SIZE) {
+      console.warn(`⚠️ Large chunk detected in ${streamId}: ${data.length} bytes`)
+      // Split large chunks if needed
+      const chunks = this.splitLargeChunk(data)
+      for (const chunk of chunks) {
+        await stream.writeSSE({ data: chunk })
+        // Small delay to prevent overwhelming the client
+        await new Promise(resolve => setTimeout(resolve, 1))
+      }
+    } else {
+      await stream.writeSSE({ data })
+    }
+  }
+
+  /**
+   * Split large chunks into smaller pieces
+   */
+  private splitLargeChunk(data: string): string[] {
+    const chunks: string[] = []
+    const maxChunkSize = Math.floor(this.MAX_BUFFER_SIZE / 2) // Use half of max buffer
+
+    for (let i = 0; i < data.length; i += maxChunkSize) {
+      chunks.push(data.slice(i, i + maxChunkSize))
+    }
+
+    return chunks
+  }
+
+  /**
+   * Check memory usage and perform cleanup if needed
+   */
+  private checkMemoryUsage(): void {
+    const memUsage = process.memoryUsage()
+    const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024)
+    const heapTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024)
+
+    console.log(`🧠 Memory: ${heapUsedMB}MB used / ${heapTotalMB}MB total`)
+
+    // If memory usage is high, trigger garbage collection if available
+    if (heapUsedMB > 500 && global.gc) {
+      console.log(`🧹 High memory usage detected, triggering GC`)
+      global.gc()
+    }
+
+    // Log memory warning if usage is very high
+    if (heapUsedMB > 1000) {
+      console.warn(`⚠️ High memory usage: ${heapUsedMB}MB. Consider restarting the server.`)
+    }
+  }
+
+  /**
+   * Get success rate percentage
+   */
+  private getSuccessRate(): number {
+    if (this.streamMetrics.totalRequests === 0) return 100
+    return Math.round((this.streamMetrics.successfulStreams / this.streamMetrics.totalRequests) * 100)
+  }
+
+  /**
+   * Update stream completion metrics
+   */
+  private updateStreamMetrics(streamId: string, success: boolean, duration: number): void {
+    if (success) {
+      this.streamMetrics.successfulStreams++
+    } else {
+      this.streamMetrics.failedStreams++
+    }
+
+    // Update average duration (rolling average)
+    const totalCompleted = this.streamMetrics.successfulStreams + this.streamMetrics.failedStreams
+    this.streamMetrics.averageStreamDuration =
+      (this.streamMetrics.averageStreamDuration * (totalCompleted - 1) + duration) / totalCompleted
+  }
+
+  /**
+   * Format uptime in human-readable format
+   */
+  private formatUptime(milliseconds: number): string {
+    const seconds = Math.floor(milliseconds / 1000)
+    const minutes = Math.floor(seconds / 60)
+    const hours = Math.floor(minutes / 60)
+    const days = Math.floor(hours / 24)
+
+    if (days > 0) {
+      return `${days}d ${hours % 24}h ${minutes % 60}m`
+    } else if (hours > 0) {
+      return `${hours}h ${minutes % 60}m ${seconds % 60}s`
+    } else if (minutes > 0) {
+      return `${minutes}m ${seconds % 60}s`
+    } else {
+      return `${seconds}s`
+    }
   }
 
   /**
@@ -759,6 +943,53 @@ export class CopilotAPIServer {
     console.log(`📖 OpenAPI endpoint: http://${this.hostname}:${this.port}/v1/chat/completions`)
     console.log(`🔐 Auth status: http://${this.hostname}:${this.port}/auth/status`)
     console.log(`📋 Available models: http://${this.hostname}:${this.port}/v1/models`)
+    console.log(`📊 Metrics endpoint: http://${this.hostname}:${this.port}/metrics`)
+    console.log(`⚙️  Max concurrent streams: ${this.MAX_CONCURRENT_STREAMS}`)
+    console.log(`🧠 Max buffer size: ${this.MAX_BUFFER_SIZE} bytes`)
+
+    // Store server reference for graceful shutdown
+    this.server = server
+  }
+
+  /**
+   * Graceful shutdown
+   */
+  async shutdown(): Promise<void> {
+    console.log(`🛑 Initiating graceful shutdown...`)
+
+    // Stop accepting new connections
+    if (this.server) {
+      this.server.stop()
+    }
+
+    // Wait for active streams to complete (with timeout)
+    const shutdownTimeout = 30000 // 30 seconds
+    const startTime = Date.now()
+
+    while (this.activeStreams.size > 0 && (Date.now() - startTime) < shutdownTimeout) {
+      console.log(`⏳ Waiting for ${this.activeStreams.size} active streams to complete...`)
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    }
+
+    // Force close remaining streams
+    if (this.activeStreams.size > 0) {
+      console.log(`⚠️ Force closing ${this.activeStreams.size} remaining streams`)
+      this.activeStreams.clear()
+    }
+
+    // Clean up monitoring intervals
+    if (this.memoryMonitor) {
+      clearInterval(this.memoryMonitor)
+    }
+
+    // Log final metrics
+    console.log(`📊 Final metrics:`)
+    console.log(`   Total requests: ${this.streamMetrics.totalRequests}`)
+    console.log(`   Success rate: ${this.getSuccessRate()}%`)
+    console.log(`   Total chunks: ${this.streamMetrics.totalChunks}`)
+    console.log(`   Peak concurrent: ${this.streamMetrics.peakConcurrentStreams}`)
+
+    console.log(`✅ Graceful shutdown completed`)
   }
 
   /**
