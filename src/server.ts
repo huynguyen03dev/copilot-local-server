@@ -426,8 +426,10 @@ export class CopilotAPIServer {
         })
 
         if (response.ok) {
-          console.log(`✅ Success with endpoint: ${apiUrl}`)
           const copilotResponse = await response.json()
+          const actualModel = copilotResponse.model || request.model || 'unknown'
+          console.log(`✅ Success with endpoint: ${apiUrl}`)
+          console.log(`🤖 Non-streaming response using model: ${actualModel}`)
           console.log("Copilot response received:", JSON.stringify(copilotResponse, null, 2))
           return this.transformCopilotResponse(copilotResponse, request)
         } else if (response.status === 404) {
@@ -540,7 +542,7 @@ export class CopilotAPIServer {
 
         if (response.ok) {
           console.log(`✅ Success with streaming endpoint: ${apiUrl}`)
-          await this.processStreamingResponse(response, stream, request, streamId)
+          await this.processStreamingResponse(response, stream, request, streamId, apiUrl)
           clearTimeout(streamTimeout)
           console.log(`🎉 Streaming request ${streamId} completed successfully`)
           return
@@ -578,7 +580,8 @@ export class CopilotAPIServer {
     response: Response,
     stream: any,
     request: ChatCompletionRequest,
-    streamId: string
+    streamId: string,
+    apiUrl?: string
   ): Promise<void> {
     const reader = response.body?.getReader()
     if (!reader) {
@@ -589,6 +592,8 @@ export class CopilotAPIServer {
     let buffer = ""
     let chunkCount = 0
     let lastActivityTime = Date.now()
+    let actualModel: string | null = null
+    let modelLogged = false
     const CHUNK_TIMEOUT = 30000 // 30 seconds between chunks
 
     // Handle client abort
@@ -618,7 +623,7 @@ export class CopilotAPIServer {
 
         const { done, value } = await reader.read()
         if (done) {
-          console.log(`📡 Stream ${streamId} completed, processed ${chunkCount} chunks`)
+          console.log(`📡 Stream ${streamId} completed, processed ${chunkCount} chunks${actualModel ? ` using ${actualModel}` : ''}`)
           break
         }
 
@@ -632,12 +637,20 @@ export class CopilotAPIServer {
             const data = line.slice(6).trim()
             if (data === '[DONE]') {
               await stream.writeSSE({ data: '[DONE]' })
-              console.log(`✅ Stream ${streamId} finished with [DONE] signal`)
+              console.log(`✅ Stream ${streamId} finished with [DONE] signal${actualModel ? ` (model: ${actualModel})` : ''}`)
               return
             }
 
             try {
               const chunk = JSON.parse(data)
+
+              // Capture the actual model from the first chunk
+              if (!modelLogged && chunk.model) {
+                actualModel = chunk.model
+                console.log(`🤖 Stream ${streamId} using model: ${actualModel} (endpoint: ${apiUrl || 'unknown'})`)
+                modelLogged = true
+              }
+
               const transformedChunk = this.transformCopilotStreamChunk(chunk, request)
               const chunkData = JSON.stringify(transformedChunk)
 
