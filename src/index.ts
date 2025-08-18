@@ -2,6 +2,7 @@
 
 import { CopilotAPIServer } from "./server"
 import { GitHubCopilotAuth } from "./auth"
+import { config, validateConfiguration } from "./config"
 
 // Parse command line arguments
 const args = process.argv.slice(2)
@@ -13,15 +14,15 @@ const clearAuthArg = args.includes("--clear-auth")
 const autoAuthArg = args.includes("--auto-auth")
 
 // Parse port and hostname for use in help text and server startup
-// Port priority: command line arg > environment variable > default (8069)
+// Port priority: command line arg > config > default
 const port = portArg
   ? parseInt(portArg.split("=")[1])
-  : parseInt(process.env.PORT || "8069")
+  : config.server.port
 
-// Hostname priority: command line arg > environment variable > default (127.0.0.1)
+// Hostname priority: command line arg > config > default
 const hostname = hostArg
   ? hostArg.split("=")[1]
-  : process.env.HOSTNAME || "127.0.0.1"
+  : config.server.hostname
 
 if (helpArg) {
   console.log(`
@@ -203,6 +204,12 @@ async function handleAutoAuth() {
 
 // Main execution
 async function main() {
+  // Validate configuration before starting
+  if (!validateConfiguration()) {
+    console.error('❌ Configuration validation failed. Please fix the errors above.')
+    process.exit(1)
+  }
+
   if (clearAuthArg) {
     await handleClearAuth()
   } else if (authArg) {

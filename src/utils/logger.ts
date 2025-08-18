@@ -3,6 +3,8 @@
  * Provides structured, configurable, and performance-optimized logging
  */
 
+import { config } from '../config'
+
 export enum LogLevel {
   DEBUG = 0,
   INFO = 1,
@@ -44,19 +46,20 @@ export class Logger {
   private logBuffer: string[] = []
   private readonly BATCH_SIZE = 5
   private batchTimeout: NodeJS.Timeout | null = null
+  private correlationId: string | null = null
 
-  constructor(config?: Partial<LoggerConfig>) {
+  constructor(customConfig?: Partial<LoggerConfig>) {
     this.config = {
-      level: this.parseLogLevel(process.env.LOG_LEVEL || 'info'),
-      enableColors: process.env.LOG_COLORS !== 'false',
-      enableTimestamps: process.env.LOG_TIMESTAMPS === 'true',
-      enableCategories: process.env.LOG_CATEGORIES !== 'false',
-      chunkLogFrequency: parseInt(process.env.CHUNK_LOG_FREQUENCY || '0'), // 0 = adaptive
-      enableProgressLogs: process.env.ENABLE_PROGRESS_LOGS !== 'false',
-      enableEndpointLogs: process.env.ENABLE_ENDPOINT_LOGS !== 'false',
-      enableModelLogs: process.env.ENABLE_MODEL_LOGS !== 'false',
-      enableMemoryLogs: process.env.ENABLE_MEMORY_LOGS !== 'false',
-      ...config
+      level: this.parseLogLevel(config.logging.level),
+      enableColors: config.logging.enableColors,
+      enableTimestamps: config.logging.enableTimestamps,
+      enableCategories: config.logging.enableCategories,
+      chunkLogFrequency: config.logging.chunkLogFrequency,
+      enableProgressLogs: config.logging.enableProgressLogs,
+      enableEndpointLogs: config.logging.enableEndpointLogs,
+      enableModelLogs: config.logging.enableModelLogs,
+      enableMemoryLogs: config.logging.enableMemoryLogs,
+      ...customConfig
     }
   }
 
@@ -75,14 +78,33 @@ export class Logger {
     return level >= this.config.level
   }
 
-  private formatMessage(level: LogLevel, category: string, message: string, ...args: any[]): string {
+  /**
+   * Set correlation ID for request tracking
+   */
+  setCorrelationId(id: string | null): void {
+    this.correlationId = id
+  }
+
+  /**
+   * Get current correlation ID
+   */
+  getCorrelationId(): string | null {
+    return this.correlationId
+  }
+
+  private formatMessage(level: LogLevel, category: string, message: string, ...args: unknown[]): string {
     const parts: string[] = []
     
     // Timestamp
     if (this.config.enableTimestamps) {
       parts.push(`[${new Date().toISOString()}]`)
     }
-    
+
+    // Correlation ID
+    if (this.correlationId) {
+      parts.push(`[${this.correlationId}]`)
+    }
+
     // Level with emoji
     const levelEmojis = {
       [LogLevel.DEBUG]: '🔍',
@@ -102,13 +124,24 @@ export class Logger {
     
     // Additional arguments
     if (args.length > 0) {
-      parts.push(...args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)))
+      parts.push(...args.map(arg => {
+        if (arg === null) return 'null'
+        if (arg === undefined) return 'undefined'
+        if (typeof arg === 'object') {
+          try {
+            return JSON.stringify(arg)
+          } catch {
+            return '[Circular Object]'
+          }
+        }
+        return String(arg)
+      }))
     }
     
     return parts.join(' ')
   }
 
-  private log(level: LogLevel, category: string, message: string, ...args: any[]): void {
+  private log(level: LogLevel, category: string, message: string, ...args: unknown[]): void {
     if (!this.shouldLog(level)) return
     
     const formattedMessage = this.formatMessage(level, category, message, ...args)
@@ -150,19 +183,19 @@ export class Logger {
   }
 
   // Public logging methods
-  debug(category: string, message: string, ...args: any[]): void {
+  debug(category: string, message: string, ...args: unknown[]): void {
     this.log(LogLevel.DEBUG, category, message, ...args)
   }
 
-  info(category: string, message: string, ...args: any[]): void {
+  info(category: string, message: string, ...args: unknown[]): void {
     this.log(LogLevel.INFO, category, message, ...args)
   }
 
-  warn(category: string, message: string, ...args: any[]): void {
+  warn(category: string, message: string, ...args: unknown[]): void {
     this.log(LogLevel.WARN, category, message, ...args)
   }
 
-  error(category: string, message: string, ...args: any[]): void {
+  error(category: string, message: string, ...args: unknown[]): void {
     this.log(LogLevel.ERROR, category, message, ...args)
   }
 

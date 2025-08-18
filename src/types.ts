@@ -123,7 +123,61 @@ export const ChatCompletionStreamChunk = z.object({
 export type DeltaMessage = z.infer<typeof DeltaMessage>
 export type ChatCompletionStreamChunk = z.infer<typeof ChatCompletionStreamChunk>
 
-// Error Types
+// Re-export error types from dedicated error module
+export type {
+  APIErrorType,
+  APIErrorResponse,
+  AuthenticationError,
+  StreamingError,
+  ValidationError,
+  NetworkError,
+  ConfigurationError,
+  ServerError,
+  BaseError
+} from './types/errors'
+
+export {
+  ErrorFactory,
+  isAPIError,
+  toAPIErrorResponse,
+  formatErrorForLogging,
+  isAuthenticationError,
+  isStreamingError,
+  isValidationError,
+  isNetworkError,
+  isConfigurationError,
+  isServerError
+} from './types/errors'
+
+// Re-export HTTP types
+export type {
+  HTTPMethod,
+  HTTPStatusCode,
+  RequestHeaders,
+  ResponseHeaders,
+  HTTPRequest,
+  HTTPResponse,
+  FetchOptions,
+  CopilotAPIEndpoint,
+  CopilotAPIResponse,
+  StreamChunk,
+  StreamingResponse,
+  RequestContext,
+  ResponseContext
+} from './types/http'
+
+export {
+  isHTTPMethod,
+  isSuccessStatus,
+  isClientError,
+  isServerError as isHTTPServerError,
+  isRedirect,
+  parseContentType,
+  buildQueryString,
+  parseUserAgent
+} from './types/http'
+
+// Legacy APIError interface for backward compatibility
 export interface APIError {
   error: {
     message: string

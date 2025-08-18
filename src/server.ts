@@ -9,7 +9,13 @@ import {
   ChatCompletionResponse,
   ChatCompletionStreamChunk,
   APIError,
-  type ChatMessage
+  APIErrorResponse,
+  ErrorFactory,
+  toAPIErrorResponse,
+  type ChatMessage,
+  type StreamingError,
+  type NetworkError,
+  type ValidationError
 } from "./types"
 import {
   validateContent,
@@ -24,6 +30,15 @@ import {
   memoryLogger,
   type EndpointAttempt
 } from "./utils/logger"
+import { config, logConfiguration } from "./config"
+import { securityConfig } from "./config/security"
+import { correlationMiddleware } from "./middleware/correlation"
+import {
+  ErrorBoundary,
+  StreamingErrorBoundary,
+  NetworkErrorBoundary,
+  type ErrorBoundaryResult
+} from "./utils/errorBoundary"
 
 export class CopilotAPIServer {
   private app: Hono
@@ -33,8 +48,8 @@ export class CopilotAPIServer {
   // Connection management
   private activeStreams = new Set<string>()
   private streamingRateLimit = new Map<string, number>()
-  private readonly MAX_CONCURRENT_STREAMS = parseInt(process.env.MAX_STREAMS || "100")
-  private readonly RATE_LIMIT_INTERVAL = 1000 // 1 second between streaming requests per client
+  private readonly MAX_CONCURRENT_STREAMS = config.server.maxConcurrentStreams
+  private readonly RATE_LIMIT_INTERVAL = config.streaming.rateLimitInterval
 
   // Performance monitoring
   private streamMetrics = {
@@ -49,46 +64,58 @@ export class CopilotAPIServer {
   }
 
   // Memory management
-  private readonly MAX_BUFFER_SIZE = parseInt(process.env.MAX_BUFFER_SIZE || "1048576") // 1MB
-  private readonly MEMORY_CHECK_INTERVAL = 30000 // 30 seconds
+  private readonly MAX_BUFFER_SIZE = config.streaming.maxBufferSize
+  private readonly MEMORY_CHECK_INTERVAL = config.monitoring.memoryCheckInterval
   private memoryMonitor: NodeJS.Timeout | null = null
 
   // Server instance for graceful shutdown
   private server: any = null
 
   constructor(
-    port: number = parseInt(process.env.PORT || "8069"),
-    hostname: string = process.env.HOSTNAME || "127.0.0.1"
+    port: number = config.server.port,
+    hostname: string = config.server.hostname
   ) {
     this.port = port
     this.hostname = hostname
     this.app = new Hono()
+
+    // Log configuration on startup
+    logConfiguration()
+
     this.setupMiddleware()
     this.setupRoutes()
     this.setupConnectionMonitoring()
   }
 
   private setupMiddleware() {
-    // Enable CORS for all origins (adjust as needed)
+    // Enable request correlation tracking (must be first)
+    this.app.use("*", correlationMiddleware)
+
+    // Enable CORS with configurable security settings
     this.app.use("*", cors({
-      origin: "*",
-      allowMethods: ["GET", "POST", "OPTIONS"],
-      allowHeaders: ["Content-Type", "Authorization"],
+      origin: securityConfig.cors.origins,
+      credentials: securityConfig.cors.credentials,
+      allowMethods: securityConfig.cors.methods,
+      allowHeaders: securityConfig.cors.headers,
     }))
 
-    // Request logging
+    // Request logging (after correlation middleware)
     this.app.use("*", honoLogger())
 
     // Error handler
     this.app.onError((err, c) => {
       logger.error('SERVER', `Server error: ${err.message}`)
-      const errorResponse: APIError = {
-        error: {
-          message: err.message || "Internal server error",
-          type: "server_error",
-          code: "internal_error"
-        }
-      }
+
+      // Create typed error
+      const serverError = ErrorFactory.server(
+        'INTERNAL_ERROR',
+        err.message || "Internal server error",
+        c.req.path,
+        c.req.method
+      )
+
+      // Convert to API response format
+      const errorResponse = toAPIErrorResponse(serverError)
       return c.json(errorResponse, 500)
     })
   }
@@ -309,24 +336,54 @@ export class CopilotAPIServer {
               return c.json(errorResponse, 503)
             }
 
-            // Use Hono's streamSSE for streaming responses
+            // Use Hono's streamSSE for streaming responses with error boundaries
             return streamSSE(c, async (stream) => {
-              const streamId = `stream-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+              const streamId = `stream-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`
               const startTime = Date.now()
               this.trackStream(streamId)
 
-              try {
-                await this.forwardToCopilotStreaming(token, body, endpoint, stream, streamId)
-                const duration = Date.now() - startTime
+              // Wrap streaming operation in error boundary
+              const result = await StreamingErrorBoundary.handleStreamingOperation(
+                async () => {
+                  await this.forwardToCopilotStreaming(token, body, endpoint, stream, streamId)
+                },
+                streamId,
+                {
+                  retryAttempts: 1,
+                  retryDelay: 1000,
+                  timeoutMs: 60000,
+                  category: 'STREAMING'
+                }
+              )
+
+              const duration = Date.now() - startTime
+
+              if (result.success) {
                 this.updateStreamMetrics(streamId, true, duration)
-              } catch (error) {
-                logger.error('STREAM', `Streaming error: ${error instanceof Error ? error.message : 'Unknown error'}`)
-                const duration = Date.now() - startTime
+                streamLogger.complete({
+                  streamId,
+                  chunkCount: 0, // Will be updated by the streaming method
+                  duration,
+                  startTime
+                })
+              } else {
                 this.updateStreamMetrics(streamId, false, duration)
-                await this.handleStreamingError(stream, error instanceof Error ? error : new Error("Streaming failed"), `endpoint-${streamId}`)
-              } finally {
-                this.untrackStream(streamId)
+
+                // Handle streaming error with proper error boundary
+                const streamingError = result.error || StreamingErrorBoundary.createStreamingError(
+                  'STREAM_FAILED',
+                  'Streaming operation failed after retries',
+                  streamId
+                )
+
+                await this.handleStreamingError(
+                  stream,
+                  new Error(streamingError.message),
+                  `streaming-boundary-${streamId}`
+                )
               }
+
+              this.untrackStream(streamId)
             })
           } else {
             // Forward request to GitHub Copilot API (non-streaming)
@@ -365,7 +422,7 @@ export class CopilotAPIServer {
         data: [
           {
             id: "gpt-4o",
-            object: "model",
+            object: "model", 
             created: Date.now(),
             owned_by: "github-copilot"
           },
@@ -377,6 +434,36 @@ export class CopilotAPIServer {
           },
           {
             id: "claude-sonnet-4",
+            object: "model",
+            created: Date.now(),
+            owned_by: "github-copilot"
+          },
+          {
+            id: "gemini-2.0-flash-001",
+            object: "model",
+            created: Date.now(),
+            owned_by: "github-copilot"
+          },
+          {
+            id: "gpt-5-mini",
+            object: "model",
+            created: Date.now(),
+            owned_by: "github-copilot"
+          },
+          {
+            id: "o4-mini",
+            object: "model",
+            created: Date.now(),
+            owned_by: "github-copilot"
+          },
+          {
+            id: "o3-mini",
+            object: "model",
+            created: Date.now(),
+            owned_by: "github-copilot"
+          },
+          {
+            id: "gemini-2.5-pro",
             object: "model",
             created: Date.now(),
             owned_by: "github-copilot"
@@ -454,39 +541,56 @@ export class CopilotAPIServer {
       console.log(`Trying request to: ${apiUrl} with format ${config.format}`)
       console.log(`Request body:`, JSON.stringify(requestBody, null, 2))
 
-      try {
-        const response = await fetch(apiUrl, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${token}`,
-            "Content-Type": "application/json",
-            "User-Agent": "GitHubCopilotChat/0.26.7",
-            "Editor-Version": "vscode/1.99.3",
-            "Editor-Plugin-Version": "copilot-chat/0.26.7",
-          },
-          body: JSON.stringify(requestBody),
-        })
+      // Wrap network request in error boundary
+      const networkResult = await NetworkErrorBoundary.handleRequest(
+        async () => {
+          const response = await fetch(apiUrl, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${token}`,
+              "Content-Type": "application/json",
+              "User-Agent": "GitHubCopilotChat/0.26.7",
+              "Editor-Version": "vscode/1.99.3",
+              "Editor-Plugin-Version": "copilot-chat/0.26.7",
+            },
+            body: JSON.stringify(requestBody),
+          })
 
-        if (response.ok) {
-          const copilotResponse = await response.json()
-          const actualModel = copilotResponse.model || request.model || 'unknown'
-          logger.info('ENDPOINT', `✅ Non-streaming success: ${apiUrl}`)
-          logger.info('MODEL', `🤖 Non-streaming response using model: ${actualModel}`)
-          logger.debug('RESPONSE', `Copilot response received: ${JSON.stringify(copilotResponse, null, 2)}`)
-          return this.transformCopilotResponse(copilotResponse, request)
-        } else if (response.status === 404) {
-          logger.debug('ENDPOINT', `❌ 404 for endpoint: ${apiUrl}, trying next...`)
-          continue
-        } else {
-          // Non-404 error, log and continue
-          const errorText = await response.text()
-          logger.warn('ENDPOINT', `❌ ${response.status} for endpoint: ${apiUrl} - ${errorText}`)
-          lastError = new Error(`HTTP ${response.status}: ${errorText}`)
-          continue
+          if (response.ok) {
+            const copilotResponse = await response.json()
+            const actualModel = copilotResponse.model || request.model || 'unknown'
+            logger.info('ENDPOINT', `✅ Non-streaming success: ${apiUrl}`)
+            logger.info('MODEL', `🤖 Non-streaming response using model: ${actualModel}`)
+            logger.debug('RESPONSE', `Copilot response received: ${JSON.stringify(copilotResponse, null, 2)}`)
+            return this.transformCopilotResponse(copilotResponse, request)
+          } else if (response.status === 404) {
+            throw new Error(`Endpoint not found: ${apiUrl}`)
+          } else {
+            const errorText = await response.text()
+            throw new Error(`HTTP ${response.status}: ${errorText}`)
+          }
+        },
+        apiUrl,
+        {
+          retryAttempts: 1,
+          retryDelay: 500,
+          timeoutMs: 15000,
+          category: 'NETWORK'
         }
-      } catch (error) {
-        logger.debug('ENDPOINT', `❌ Network error for endpoint: ${apiUrl} - ${error}`)
-        lastError = error instanceof Error ? error : new Error(String(error))
+      )
+
+      if (networkResult.success && networkResult.data) {
+        return networkResult.data
+      } else {
+        const error = networkResult.error
+        if (error) {
+          if (error.message.includes('404') || error.message.includes('not found')) {
+            logger.debug('ENDPOINT', `❌ 404 for endpoint: ${apiUrl}, trying next...`)
+          } else {
+            logger.warn('ENDPOINT', `❌ Request failed for endpoint: ${apiUrl} - ${error.message}`)
+          }
+          lastError = new Error(error.message)
+        }
         continue
       }
     }
@@ -495,22 +599,64 @@ export class CopilotAPIServer {
     throw new Error(`All Copilot API endpoints failed. Last error: ${lastError?.message || "Unknown error"}`)
   }
 
-  private transformCopilotResponse(copilotResponse: any, request: ChatCompletionRequest): ChatCompletionResponse {
+  private transformCopilotResponse(copilotResponse: unknown, request: ChatCompletionRequest): ChatCompletionResponse {
+    // Type guard and safe property access
+    const response = copilotResponse as Record<string, unknown>
+    const responseId = typeof response?.id === 'string' ? response.id : `chatcmpl-${Date.now()}`
+    const responseCreated = typeof response?.created === 'number' ? response.created : Math.floor(Date.now() / 1000)
+    const responseChoices = Array.isArray(response?.choices) ? response.choices : []
+    const responseUsage = response?.usage && typeof response.usage === 'object' ? response.usage as Record<string, unknown> : undefined
+
+    // Extract content from various possible response formats
+    let content = "No response from Copilot"
+    if (typeof response?.content === 'string') {
+      content = response.content
+    } else if (response?.message && typeof response.message === 'object') {
+      const message = response.message as Record<string, unknown>
+      if (typeof message?.content === 'string') {
+        content = message.content
+      }
+    } else if (responseChoices.length > 0) {
+      const firstChoice = responseChoices[0] as Record<string, unknown>
+      if (firstChoice?.message && typeof firstChoice.message === 'object') {
+        const message = firstChoice.message as Record<string, unknown>
+        if (typeof message?.content === 'string') {
+          content = message.content
+        }
+      }
+    }
+
     // Transform response to OpenAI format
     const openAIResponse: ChatCompletionResponse = {
-      id: copilotResponse.id || `chatcmpl-${Date.now()}`,
+      id: responseId,
       object: "chat.completion",
-      created: copilotResponse.created || Math.floor(Date.now() / 1000),
+      created: responseCreated,
       model: request.model,
-      choices: copilotResponse.choices || [{
+      choices: responseChoices.length > 0 ? responseChoices.map((choice, index) => {
+        const choiceObj = choice as Record<string, unknown>
+        return {
+          index,
+          message: {
+            role: "assistant",
+            content: typeof choiceObj?.message === 'object' && choiceObj.message !== null
+              ? (choiceObj.message as Record<string, unknown>)?.content as string || content
+              : content
+          },
+          finish_reason: typeof choiceObj?.finish_reason === 'string' ? choiceObj.finish_reason : "stop"
+        }
+      }) : [{
         index: 0,
         message: {
           role: "assistant",
-          content: copilotResponse.content || copilotResponse.message?.content || "No response from Copilot"
+          content
         },
         finish_reason: "stop"
       }],
-      usage: copilotResponse.usage
+      usage: responseUsage ? {
+        prompt_tokens: typeof responseUsage.prompt_tokens === 'number' ? responseUsage.prompt_tokens : 0,
+        completion_tokens: typeof responseUsage.completion_tokens === 'number' ? responseUsage.completion_tokens : 0,
+        total_tokens: typeof responseUsage.total_tokens === 'number' ? responseUsage.total_tokens : 0
+      } : undefined
     }
 
     return openAIResponse
@@ -697,37 +843,58 @@ export class CopilotAPIServer {
               return
             }
 
-            try {
-              const chunk = JSON.parse(data)
+            // Process chunk with error boundary
+            const chunkResult = StreamingErrorBoundary.handleChunkProcessing(
+              () => {
+                const chunk = JSON.parse(data)
 
-              // Capture the actual model from the first chunk
-              if (!modelLogged && chunk.model) {
-                actualModel = chunk.model
-                modelLogger.info(streamId, actualModel, apiUrl || undefined)
-                modelLogged = true
+                // Capture the actual model from the first chunk
+                if (!modelLogged && chunk.model) {
+                  actualModel = chunk.model
+                  modelLogger.info(streamId, actualModel, apiUrl ?? '')
+                  modelLogged = true
+                }
+
+                const transformedChunk = this.transformCopilotStreamChunk(chunk, request)
+                return {
+                  chunk,
+                  transformedChunk,
+                  chunkData: JSON.stringify(transformedChunk)
+                }
+              },
+              streamId,
+              chunkCount
+            )
+
+            if (chunkResult.success && chunkResult.data) {
+              try {
+                // Implement backpressure handling with error boundary
+                await this.writeWithBackpressure(stream, chunkResult.data.chunkData, streamId)
+
+                chunkCount++
+                this.streamMetrics.totalChunks++
+                this.streamMetrics.totalBytes += chunkResult.data.chunkData.length
+              } catch (writeError) {
+                logger.error('STREAM', `💥 Failed to write chunk ${chunkCount} for stream ${streamId}: ${writeError}`)
+                throw StreamingErrorBoundary.createStreamingError(
+                  'STREAM_FAILED',
+                  `Failed to write chunk: ${writeError instanceof Error ? writeError.message : 'Unknown error'}`,
+                  streamId,
+                  chunkCount
+                )
               }
-
-              const transformedChunk = this.transformCopilotStreamChunk(chunk, request)
-              const chunkData = JSON.stringify(transformedChunk)
-
-              // Implement backpressure handling
-              await this.writeWithBackpressure(stream, chunkData, streamId)
-
-              chunkCount++
-              this.streamMetrics.totalChunks++
-              this.streamMetrics.totalBytes += chunkData.length
-
-              // Log progress with adaptive frequency
-              streamLogger.progress({
-                streamId,
-                chunkCount,
-                model: actualModel || undefined,
-                startTime
-              })
-            } catch (parseError) {
-              console.warn(`⚠️ Failed to parse streaming chunk in ${streamId}:`, parseError)
-              // Continue processing other chunks instead of failing completely
+            } else {
+              logger.warn('STREAM', `⚠️ Skipping malformed chunk ${chunkCount} for stream ${streamId}`)
+              continue
             }
+
+            // Log progress with adaptive frequency
+            streamLogger.progress({
+              streamId,
+              chunkCount,
+              model: actualModel || undefined,
+              startTime
+            })
           }
         }
       }
@@ -743,29 +910,48 @@ export class CopilotAPIServer {
   }
 
   private transformCopilotStreamChunk(
-    copilotChunk: any,
+    copilotChunk: unknown,
     request: ChatCompletionRequest
   ): ChatCompletionStreamChunk {
+    // Type guard and safe property access
+    const chunk = copilotChunk as Record<string, unknown>
+    const chunkId = typeof chunk?.id === 'string' ? chunk.id : `chatcmpl-${Date.now()}`
+    const chunkCreated = typeof chunk?.created === 'number' ? chunk.created : Math.floor(Date.now() / 1000)
+    const chunkChoices = Array.isArray(chunk?.choices) ? chunk.choices : []
+    const chunkUsage = chunk?.usage && typeof chunk.usage === 'object' ? chunk.usage as Record<string, unknown> : undefined
+
     return {
-      id: copilotChunk.id || `chatcmpl-${Date.now()}`,
+      id: chunkId,
       object: "chat.completion.chunk",
-      created: copilotChunk.created || Math.floor(Date.now() / 1000),
+      created: chunkCreated,
       model: request.model,
-      choices: copilotChunk.choices?.map((choice: any) => ({
-        index: choice.index || 0,
-        delta: {
-          role: choice.delta?.role,
-          content: choice.delta?.content,
-        },
-        finish_reason: choice.finish_reason,
-      })) || [{
+      choices: chunkChoices.length > 0 ? chunkChoices.map((choice, index) => {
+        const choiceObj = choice as Record<string, unknown>
+        const delta = choiceObj?.delta as Record<string, unknown> | undefined
+        // Validate role is one of the allowed values
+        const roleValue = typeof delta?.role === 'string' ? delta.role : undefined
+        const validRole = roleValue === 'system' || roleValue === 'user' || roleValue === 'assistant' ? roleValue : undefined
+
+        return {
+          index: typeof choiceObj?.index === 'number' ? choiceObj.index : index,
+          delta: {
+            role: validRole,
+            content: typeof delta?.content === 'string' ? delta.content : undefined,
+          },
+          finish_reason: typeof choiceObj?.finish_reason === 'string' ? choiceObj.finish_reason : null,
+        }
+      }) : [{
         index: 0,
         delta: {
-          content: copilotChunk.content || "",
+          content: typeof chunk?.content === 'string' ? chunk.content : "",
         },
         finish_reason: null,
       }],
-      usage: copilotChunk.usage,
+      usage: chunkUsage ? {
+        prompt_tokens: typeof chunkUsage.prompt_tokens === 'number' ? chunkUsage.prompt_tokens : 0,
+        completion_tokens: typeof chunkUsage.completion_tokens === 'number' ? chunkUsage.completion_tokens : 0,
+        total_tokens: typeof chunkUsage.total_tokens === 'number' ? chunkUsage.total_tokens : 0
+      } : undefined,
     }
   }
 

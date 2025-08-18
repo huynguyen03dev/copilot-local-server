@@ -2,6 +2,7 @@ import path from "path"
 import fs from "fs/promises"
 import { z } from "zod"
 import { spawn } from "child_process"
+import { AuthErrorBoundary } from "./utils/errorBoundary"
 import type {
   DeviceCodeResponse,
   AccessTokenResponse,
@@ -48,6 +49,7 @@ export class GitHubCopilotAuth {
 
       return true
     } catch (error) {
+      // Use console.warn for user-facing authentication messages
       console.warn(`Failed to open browser automatically: ${error}`)
       return false
     }
@@ -186,35 +188,51 @@ export class GitHubCopilotAuth {
     if (!info || info.type !== "oauth") return null
     if (info.access && info.expires > Date.now()) return info.access
 
-    // Get new Copilot API token
-    const response = await fetch(this.COPILOT_API_KEY_URL, {
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${info.refresh}`,
-        "User-Agent": "GitHubCopilotChat/0.26.7",
-        "Editor-Version": "vscode/1.99.3",
-        "Editor-Plugin-Version": "copilot-chat/0.26.7",
-      },
-    })
+    // Get new Copilot API token with error boundary
+    const tokenResult = await AuthErrorBoundary.handleAuthOperation(
+      async () => {
+        const response = await fetch(this.COPILOT_API_KEY_URL, {
+          headers: {
+            Accept: "application/json",
+            Authorization: `Bearer ${info.refresh}`,
+            "User-Agent": "GitHubCopilotChat/0.26.7",
+            "Editor-Version": "vscode/1.99.3",
+            "Editor-Plugin-Version": "copilot-chat/0.26.7",
+          },
+        })
 
-    if (!response.ok) {
-      console.error(`Failed to get Copilot token: ${response.status} ${response.statusText}`)
+        if (!response.ok) {
+          throw new Error(`Failed to get Copilot token: ${response.status} ${response.statusText}`)
+        }
+
+        const tokenData: CopilotTokenResponse = await response.json()
+        console.log("Copilot token response:", JSON.stringify(tokenData, null, 2))
+
+        // Store the Copilot API token and endpoint
+        await this.setAuth({
+          type: "oauth",
+          refresh: info.refresh,
+          access: tokenData.token,
+          expires: tokenData.expires_at * 1000,
+          endpoint: tokenData.endpoints?.api, // Store the API endpoint
+        })
+
+        return tokenData.token
+      },
+      'get-access-token',
+      {
+        retryAttempts: 2,
+        retryDelay: 1000,
+        timeoutMs: 10000
+      }
+    )
+
+    if (tokenResult.success && tokenResult.data) {
+      return tokenResult.data
+    } else {
+      console.error(`Failed to get Copilot token after retries: ${tokenResult.error?.message || 'Unknown error'}`)
       return null
     }
-
-    const tokenData: CopilotTokenResponse = await response.json()
-    console.log("Copilot token response:", JSON.stringify(tokenData, null, 2))
-
-    // Store the Copilot API token and endpoint
-    await this.setAuth({
-      type: "oauth",
-      refresh: info.refresh,
-      access: tokenData.token,
-      expires: tokenData.expires_at * 1000,
-      endpoint: tokenData.endpoints?.api, // Store the API endpoint
-    })
-
-    return tokenData.token
   }
 
   /**
@@ -519,7 +537,7 @@ export class GitHubCopilotAuth {
   }
 
   private static async setAuth(info: OAuthInfo): Promise<void> {
-    let data: Record<string, any> = {}
+    let data: Record<string, unknown> = {}
     
     try {
       const existing = await fs.readFile(this.AUTH_FILE, "utf-8")
