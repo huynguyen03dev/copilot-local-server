@@ -180,13 +180,73 @@ REQUEST_TIMEOUT=300000
 
 # Development Settings
 NODE_ENV=development
-LOG_LEVEL=info
+
+# Enhanced Logging Configuration
+LOG_LEVEL=info                    # debug, info, warn, error, silent
+LOG_COLORS=true                   # Enable colored output
+LOG_TIMESTAMPS=false              # Include timestamps in logs
+LOG_CATEGORIES=true               # Show log categories [STREAM], [ENDPOINT], etc.
+CHUNK_LOG_FREQUENCY=0             # 0=adaptive, >0=fixed frequency
+ENABLE_PROGRESS_LOGS=true         # Stream progress logging
+ENABLE_ENDPOINT_LOGS=true         # Endpoint discovery logging
+ENABLE_MODEL_LOGS=true            # Model information logging
+ENABLE_MEMORY_LOGS=true           # Memory usage logging
 ```
 
 **Configuration Priority** (highest to lowest):
 1. Command line arguments (`--port=8080`)
 2. Environment variables (`PORT=8080` or `.env` file)
 3. Default values (`8069`)
+
+### Enhanced Logging System
+
+The server includes a sophisticated logging system optimized for different environments:
+
+**Log Levels:**
+- `debug` - Verbose logging for development (shows all endpoint attempts, frequent progress updates)
+- `info` - Standard logging for production (essential information, moderate progress updates)
+- `warn` - Warnings and errors only (minimal logging for critical production)
+- `error` - Errors only
+- `silent` - No logging
+
+**Milestone-Based Chunk Logging:**
+- **Development (`debug`)**: Milestones (10, 25, 50, 100, 250, 500, 1000) + percentages for large streams
+- **Production (`info`)**: Major milestones only (≥100 chunks)
+- **Critical (`warn`)**: No progress logging
+- **Custom**: Set `CHUNK_LOG_FREQUENCY=50` for fixed frequency
+
+**Environment-Specific Configurations:**
+```bash
+# Development (verbose)
+cp .env.development .env
+
+# Production (balanced)
+cp .env.production .env
+
+# Critical Production (minimal)
+cp .env.production.minimal .env
+```
+
+**Before vs After Logging (625-chunk example):**
+```bash
+# Before: 625 chunks = 25+ log lines
+🔍 [ENDPOINT] Trying streaming request to: https://...
+🔍 [ENDPOINT] ❌ 404 for endpoint: https://..., trying next...
+ℹ️ [ENDPOINT] ✅ Success with endpoint: https://...
+ℹ️ [MODEL] 🤖 Stream stream-123 using model: gpt-4o-2024-11-20
+🔍 [PROGRESS] 📊 Stream stream-123: 25 chunks processed
+🔍 [PROGRESS] 📊 Stream stream-123: 50 chunks processed
+[... 23 more progress lines ...]
+
+# After: 625 chunks = 7 essential lines
+📈 Stream stream-123 started. Active: 1/100
+✅ Using endpoint: https://api.individual.githubcopilot.com/chat/completions
+📊 Stream stream-123: 25% complete (156/625)
+📊 Stream stream-123: 50% complete (312/625)
+📊 Stream stream-123: 75% complete (468/625)
+✅ Stream completed: 625 chunks in 45s (14/sec) - gpt-4o-2024-11-20
+📉 Stream stream-123 ended. Active: 0/100
+```
 
 ### Command Line Options
 

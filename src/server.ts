@@ -1,6 +1,6 @@
 import { Hono } from "hono"
 import { cors } from "hono/cors"
-import { logger } from "hono/logger"
+import { logger as honoLogger } from "hono/logger"
 import { streamSSE } from "hono/streaming"
 import { zValidator } from "@hono/zod-validator"
 import { GitHubCopilotAuth } from "./auth"
@@ -16,6 +16,14 @@ import {
   transformMessagesForCopilot,
   getContentStats
 } from "./utils/content"
+import {
+  logger,
+  streamLogger,
+  endpointLogger,
+  modelLogger,
+  memoryLogger,
+  type EndpointAttempt
+} from "./utils/logger"
 
 export class CopilotAPIServer {
   private app: Hono
@@ -69,11 +77,11 @@ export class CopilotAPIServer {
     }))
 
     // Request logging
-    this.app.use("*", logger())
+    this.app.use("*", honoLogger())
 
     // Error handler
     this.app.onError((err, c) => {
-      console.error("Server error:", err)
+      logger.error('SERVER', `Server error: ${err.message}`)
       const errorResponse: APIError = {
         error: {
           message: err.message || "Internal server error",
@@ -253,7 +261,7 @@ export class CopilotAPIServer {
           // Log content statistics for debugging
           const stats = getContentStats(message.content)
           if (stats.type === "array") {
-            console.log(`📝 Message ${i}: ${stats.textBlocks} text block(s), ${stats.imageBlocks} image(s), ${stats.totalLength} chars`)
+            logger.debug('CONTENT', `📝 Message ${i}: ${stats.textBlocks} text block(s), ${stats.imageBlocks} image(s), ${stats.totalLength} chars`)
           }
         }
 
@@ -312,7 +320,7 @@ export class CopilotAPIServer {
                 const duration = Date.now() - startTime
                 this.updateStreamMetrics(streamId, true, duration)
               } catch (error) {
-                console.error("Streaming error:", error)
+                logger.error('STREAM', `Streaming error: ${error instanceof Error ? error.message : 'Unknown error'}`)
                 const duration = Date.now() - startTime
                 this.updateStreamMetrics(streamId, false, duration)
                 await this.handleStreamingError(stream, error instanceof Error ? error : new Error("Streaming failed"), `endpoint-${streamId}`)
@@ -462,22 +470,22 @@ export class CopilotAPIServer {
         if (response.ok) {
           const copilotResponse = await response.json()
           const actualModel = copilotResponse.model || request.model || 'unknown'
-          console.log(`✅ Success with endpoint: ${apiUrl}`)
-          console.log(`🤖 Non-streaming response using model: ${actualModel}`)
-          console.log("Copilot response received:", JSON.stringify(copilotResponse, null, 2))
+          logger.info('ENDPOINT', `✅ Non-streaming success: ${apiUrl}`)
+          logger.info('MODEL', `🤖 Non-streaming response using model: ${actualModel}`)
+          logger.debug('RESPONSE', `Copilot response received: ${JSON.stringify(copilotResponse, null, 2)}`)
           return this.transformCopilotResponse(copilotResponse, request)
         } else if (response.status === 404) {
-          console.log(`❌ 404 for endpoint: ${apiUrl}, trying next...`)
+          logger.debug('ENDPOINT', `❌ 404 for endpoint: ${apiUrl}, trying next...`)
           continue
         } else {
           // Non-404 error, log and continue
           const errorText = await response.text()
-          console.log(`❌ ${response.status} for endpoint: ${apiUrl} - ${errorText}`)
+          logger.warn('ENDPOINT', `❌ ${response.status} for endpoint: ${apiUrl} - ${errorText}`)
           lastError = new Error(`HTTP ${response.status}: ${errorText}`)
           continue
         }
       } catch (error) {
-        console.log(`❌ Network error for endpoint: ${apiUrl} - ${error}`)
+        logger.debug('ENDPOINT', `❌ Network error for endpoint: ${apiUrl} - ${error}`)
         lastError = error instanceof Error ? error : new Error(String(error))
         continue
       }
@@ -515,7 +523,7 @@ export class CopilotAPIServer {
     stream: any,
     streamId: string
   ): Promise<void> {
-    console.log(`🔄 Starting streaming request ${streamId}`)
+    logger.debug('STREAM', `🔄 Starting streaming request ${streamId}`)
 
     // Set up timeout for the entire streaming request
     const streamTimeout = this.setupStreamTimeout(stream, streamId, 300000) // 5 minutes
@@ -537,7 +545,7 @@ export class CopilotAPIServer {
 
     // Transform messages to text-only format for GitHub Copilot compatibility
     const transformedMessages = transformMessagesForCopilot(request.messages)
-    console.log(`🔄 Streaming: Transformed ${request.messages.length} message(s) for Copilot compatibility`)
+    logger.debug('STREAM', `🔄 Streaming: Transformed ${request.messages.length} message(s) for Copilot compatibility`)
 
     const requestBody = {
       model: request.model,
@@ -560,10 +568,10 @@ export class CopilotAPIServer {
     ]
 
     let lastError: Error | null = null
+    const attempts: EndpointAttempt[] = []
 
     for (const config of endpointConfigs) {
       const apiUrl = `${endpoint}${config.path}`
-      console.log(`Trying streaming request to: ${apiUrl}`)
 
       try {
         const response = await fetch(apiUrl, {
@@ -578,24 +586,27 @@ export class CopilotAPIServer {
           body: JSON.stringify(requestBody),
         })
 
+        attempts.push({ url: apiUrl, status: response.status })
+
         if (response.ok) {
-          console.log(`✅ Success with streaming endpoint: ${apiUrl}`)
+          // Use consolidated endpoint discovery logging
+          endpointLogger.discovery(attempts, apiUrl)
           await this.processStreamingResponse(response, stream, request, streamId, apiUrl)
           clearTimeout(streamTimeout)
-          console.log(`🎉 Streaming request ${streamId} completed successfully`)
+          logger.info('STREAM', `🎉 Streaming request ${streamId} completed successfully`)
           return
         } else if (response.status === 404) {
-          console.log(`❌ 404 for streaming endpoint: ${apiUrl}, trying next...`)
           continue
         } else {
           // Non-404 error, log and continue
           const errorText = await response.text()
-          console.log(`❌ ${response.status} for streaming endpoint: ${apiUrl} - ${errorText}`)
+          attempts[attempts.length - 1].error = errorText
           lastError = new Error(`HTTP ${response.status}: ${errorText}`)
           continue
         }
       } catch (error) {
-        console.log(`❌ Network error for streaming endpoint: ${apiUrl}`)
+        const errorMsg = error instanceof Error ? error.message : "Unknown error"
+        attempts.push({ url: apiUrl, status: 0, error: errorMsg })
         lastError = error instanceof Error ? error : new Error("Unknown error")
         continue
       }
@@ -621,6 +632,7 @@ export class CopilotAPIServer {
     streamId: string,
     apiUrl?: string
   ): Promise<void> {
+    const startTime = Date.now()
     const reader = response.body?.getReader()
     if (!reader) {
       throw new Error("No response body reader available")
@@ -645,7 +657,7 @@ export class CopilotAPIServer {
     // Set up chunk timeout monitoring
     const chunkTimeoutInterval = setInterval(() => {
       if (Date.now() - lastActivityTime > CHUNK_TIMEOUT) {
-        console.warn(`⏰ Chunk timeout for stream ${streamId}, last activity: ${Date.now() - lastActivityTime}ms ago`)
+        logger.warn('STREAM', `⏰ Chunk timeout for stream ${streamId}, last activity: ${Date.now() - lastActivityTime}ms ago`)
         clearInterval(chunkTimeoutInterval)
         reader.releaseLock()
         throw new Error("Streaming chunk timeout - no data received for 30 seconds")
@@ -655,13 +667,19 @@ export class CopilotAPIServer {
     try {
       while (true) {
         if (isAborted) {
-          console.log(`🚫 Stream ${streamId} was aborted, stopping processing`)
+          logger.debug('STREAM', `🚫 Stream ${streamId} was aborted, stopping processing`)
           break
         }
 
         const { done, value } = await reader.read()
         if (done) {
-          console.log(`📡 Stream ${streamId} completed, processed ${chunkCount} chunks${actualModel ? ` using ${actualModel}` : ''}`)
+          const duration = Date.now() - startTime
+          streamLogger.complete({
+            streamId,
+            chunkCount,
+            model: actualModel || undefined,
+            duration
+          })
           break
         }
 
@@ -685,7 +703,7 @@ export class CopilotAPIServer {
               // Capture the actual model from the first chunk
               if (!modelLogged && chunk.model) {
                 actualModel = chunk.model
-                console.log(`🤖 Stream ${streamId} using model: ${actualModel} (endpoint: ${apiUrl || 'unknown'})`)
+                modelLogger.info(streamId, actualModel, apiUrl || undefined)
                 modelLogged = true
               }
 
@@ -699,10 +717,13 @@ export class CopilotAPIServer {
               this.streamMetrics.totalChunks++
               this.streamMetrics.totalBytes += chunkData.length
 
-              // Log progress every 10 chunks
-              if (chunkCount % 10 === 0) {
-                console.log(`📊 Stream ${streamId}: ${chunkCount} chunks processed`)
-              }
+              // Log progress with adaptive frequency
+              streamLogger.progress({
+                streamId,
+                chunkCount,
+                model: actualModel || undefined,
+                startTime
+              })
             } catch (parseError) {
               console.warn(`⚠️ Failed to parse streaming chunk in ${streamId}:`, parseError)
               // Continue processing other chunks instead of failing completely
@@ -756,19 +777,7 @@ export class CopilotAPIServer {
     error: Error,
     context: string
   ): Promise<void> {
-    console.error(`💥 Streaming error in ${context}:`, error.message)
-
-    const errorChunk: ChatCompletionStreamChunk = {
-      id: `chatcmpl-error-${Date.now()}`,
-      object: "chat.completion.chunk",
-      created: Math.floor(Date.now() / 1000),
-      model: "error",
-      choices: [{
-        index: 0,
-        delta: {},
-        finish_reason: "error",
-      }],
-    }
+    logger.error('STREAM', `💥 Streaming error in ${context}: ${error.message}`)
 
     try {
       await stream.writeSSE({
@@ -784,7 +793,7 @@ export class CopilotAPIServer {
       // Send [DONE] to properly close the stream
       await stream.writeSSE({ data: '[DONE]' })
     } catch (writeError) {
-      console.error(`💥 Failed to write error to stream in ${context}:`, writeError)
+      logger.error('STREAM', `💥 Failed to write error to stream in ${context}: ${writeError}`)
     }
   }
 
@@ -793,7 +802,7 @@ export class CopilotAPIServer {
    */
   private setupStreamTimeout(stream: any, streamId: string, timeoutMs: number = 300000): NodeJS.Timeout {
     return setTimeout(async () => {
-      console.warn(`⏰ Stream timeout for ${streamId} after ${timeoutMs}ms`)
+      logger.warn('STREAM', `⏰ Stream timeout for ${streamId} after ${timeoutMs}ms`)
       await this.handleStreamingError(
         stream,
         new Error(`Stream timeout after ${timeoutMs / 1000} seconds`),
@@ -815,10 +824,10 @@ export class CopilotAPIServer {
         this.streamMetrics.peakConcurrentStreams = currentActive
       }
 
-      console.log(`📊 Active streams: ${currentActive}/${this.MAX_CONCURRENT_STREAMS}`)
-      console.log(`📈 Peak concurrent: ${this.streamMetrics.peakConcurrentStreams}`)
-      console.log(`📊 Total requests: ${this.streamMetrics.totalRequests}`)
-      console.log(`✅ Success rate: ${this.getSuccessRate()}%`)
+      logger.info('MONITOR', `📊 Active streams: ${currentActive}/${this.MAX_CONCURRENT_STREAMS}`)
+      logger.info('MONITOR', `📈 Peak concurrent: ${this.streamMetrics.peakConcurrentStreams}`)
+      logger.info('MONITOR', `📊 Total requests: ${this.streamMetrics.totalRequests}`)
+      logger.info('MONITOR', `✅ Success rate: ${this.getSuccessRate()}%`)
 
       // Clean up old rate limit entries (older than 5 minutes)
       const fiveMinutesAgo = Date.now() - 300000
@@ -866,7 +875,7 @@ export class CopilotAPIServer {
   private trackStream(streamId: string): void {
     this.activeStreams.add(streamId)
     this.streamMetrics.totalRequests++
-    console.log(`📈 Stream ${streamId} started. Active: ${this.activeStreams.size}/${this.MAX_CONCURRENT_STREAMS}`)
+    streamLogger.start(streamId, this.activeStreams.size, this.MAX_CONCURRENT_STREAMS)
   }
 
   /**
@@ -874,7 +883,7 @@ export class CopilotAPIServer {
    */
   private untrackStream(streamId: string): void {
     this.activeStreams.delete(streamId)
-    console.log(`📉 Stream ${streamId} ended. Active: ${this.activeStreams.size}/${this.MAX_CONCURRENT_STREAMS}`)
+    streamLogger.end(streamId, this.activeStreams.size, this.MAX_CONCURRENT_STREAMS)
   }
 
   /**
@@ -922,17 +931,12 @@ export class CopilotAPIServer {
     const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024)
     const heapTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024)
 
-    console.log(`🧠 Memory: ${heapUsedMB}MB used / ${heapTotalMB}MB total`)
+    memoryLogger.usage(heapUsedMB, heapTotalMB)
 
     // If memory usage is high, trigger garbage collection if available
     if (heapUsedMB > 500 && global.gc) {
-      console.log(`🧹 High memory usage detected, triggering GC`)
+      memoryLogger.gc()
       global.gc()
-    }
-
-    // Log memory warning if usage is very high
-    if (heapUsedMB > 1000) {
-      console.warn(`⚠️ High memory usage: ${heapUsedMB}MB. Consider restarting the server.`)
     }
   }
 
@@ -947,7 +951,7 @@ export class CopilotAPIServer {
   /**
    * Update stream completion metrics
    */
-  private updateStreamMetrics(streamId: string, success: boolean, duration: number): void {
+  private updateStreamMetrics(_streamId: string, success: boolean, duration: number): void {
     if (success) {
       this.streamMetrics.successfulStreams++
     } else {
@@ -990,13 +994,13 @@ export class CopilotAPIServer {
       fetch: this.app.fetch,
     })
 
-    console.log(`🚀 GitHub Copilot API Server running on http://${this.hostname}:${this.port}`)
-    console.log(`📖 OpenAPI endpoint: http://${this.hostname}:${this.port}/v1/chat/completions`)
-    console.log(`🔐 Auth status: http://${this.hostname}:${this.port}/auth/status`)
-    console.log(`📋 Available models: http://${this.hostname}:${this.port}/v1/models`)
-    console.log(`📊 Metrics endpoint: http://${this.hostname}:${this.port}/metrics`)
-    console.log(`⚙️  Max concurrent streams: ${this.MAX_CONCURRENT_STREAMS}`)
-    console.log(`🧠 Max buffer size: ${this.MAX_BUFFER_SIZE} bytes`)
+    logger.info('SERVER', `🚀 GitHub Copilot API Server running on http://${this.hostname}:${this.port}`)
+    logger.info('SERVER', `📖 OpenAPI endpoint: http://${this.hostname}:${this.port}/v1/chat/completions`)
+    logger.info('SERVER', `🔐 Auth status: http://${this.hostname}:${this.port}/auth/status`)
+    logger.info('SERVER', `📋 Available models: http://${this.hostname}:${this.port}/v1/models`)
+    logger.info('SERVER', `📊 Metrics endpoint: http://${this.hostname}:${this.port}/metrics`)
+    logger.info('SERVER', `⚙️  Max concurrent streams: ${this.MAX_CONCURRENT_STREAMS}`)
+    logger.info('SERVER', `🧠 Max buffer size: ${this.MAX_BUFFER_SIZE} bytes`)
 
     // Store server reference for graceful shutdown
     this.server = server
@@ -1034,13 +1038,13 @@ export class CopilotAPIServer {
     }
 
     // Log final metrics
-    console.log(`📊 Final metrics:`)
-    console.log(`   Total requests: ${this.streamMetrics.totalRequests}`)
-    console.log(`   Success rate: ${this.getSuccessRate()}%`)
-    console.log(`   Total chunks: ${this.streamMetrics.totalChunks}`)
-    console.log(`   Peak concurrent: ${this.streamMetrics.peakConcurrentStreams}`)
+    logger.info('SERVER', `📊 Final metrics:`)
+    logger.info('SERVER', `   Total requests: ${this.streamMetrics.totalRequests}`)
+    logger.info('SERVER', `   Success rate: ${this.getSuccessRate()}%`)
+    logger.info('SERVER', `   Total chunks: ${this.streamMetrics.totalChunks}`)
+    logger.info('SERVER', `   Peak concurrent: ${this.streamMetrics.peakConcurrentStreams}`)
 
-    console.log(`✅ Graceful shutdown completed`)
+    logger.info('SERVER', `✅ Graceful shutdown completed`)
   }
 
   /**

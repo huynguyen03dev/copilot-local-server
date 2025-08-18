@@ -17,6 +17,7 @@
     "test-performance": "python performance-test.py",
     "test-all": "bun run test-streaming && bun run test-errors && bun run test-integration && bun run test-performance",
     "test-endpoint": "bun run test-endpoint.ts",
+    "test-logging": "bun run test-logging.ts",
     "test-stop": "python test-stop-param.py",
     "debug": "python debug-test.py",
     "monitor": "python monitoring-dashboard.py",
