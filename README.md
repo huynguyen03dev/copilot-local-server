@@ -87,7 +87,10 @@ The authentication process:
 - **Smart error handling**: Specific error messages with solutions
 - **Persistent sessions**: No need to re-authenticate every time
 
-The server will start on `http://localhost:8069` by default.
+The server will start on `http://localhost:8069` by default. You can customize the port by:
+- Setting `PORT=3000` in a `.env` file
+- Using command line: `bun run src/index.ts --port=3000`
+- Setting environment variable: `PORT=3000 bun run src/index.ts`
 
 ## Available Scripts
 
@@ -110,6 +113,8 @@ bun run type-check   # Check TypeScript types
 ## Using the API
 
 You can now use any OpenAI-compatible client to interact with GitHub Copilot:
+
+> **Note**: Examples below use port `8069` (default). Replace with your configured port if different.
 
 ```bash
 curl -X POST http://localhost:8069/v1/chat/completions \
@@ -142,14 +147,38 @@ curl -X POST http://localhost:8069/v1/chat/completions \
 
 ## Configuration
 
+### Environment Variables
+
+The server can be configured using environment variables. Copy `.env.example` to `.env` and customize as needed:
+
+```bash
+# Server Configuration
+PORT=8069
+HOSTNAME=127.0.0.1
+
+# Performance Settings
+MAX_STREAMS=100
+MAX_BUFFER_SIZE=1048576
+REQUEST_TIMEOUT=300000
+
+# Development Settings
+NODE_ENV=development
+LOG_LEVEL=info
+```
+
+**Configuration Priority** (highest to lowest):
+1. Command line arguments (`--port=8080`)
+2. Environment variables (`PORT=8080` or `.env` file)
+3. Default values (`8069`)
+
 ### Command Line Options
 
 ```bash
 bun run src/index.ts [options]
 
 Options:
-  --port=<number>     Port to listen on (default: 8069)
-  --host=<string>     Hostname to bind to (default: 127.0.0.1)
+  --port=<number>     Port to listen on (default: 8069, or PORT env var)
+  --host=<string>     Hostname to bind to (default: 127.0.0.1, or HOSTNAME env var)
   --auth              Start interactive authentication flow
   --clear-auth        Clear stored authentication
   --help, -h          Show help message
@@ -158,11 +187,22 @@ Options:
 ### Examples
 
 ```bash
-# Start server on custom port
+# Start server with default settings (uses .env file)
+bun run src/index.ts
+
+# Start server on custom port via command line
 bun run src/index.ts --port=8080
+
+# Start server on custom port via environment variable
+PORT=3000 bun run src/index.ts
 
 # Bind to all interfaces
 bun run src/index.ts --host=0.0.0.0
+
+# Set up custom configuration
+cp .env.example .env
+# Edit .env with your settings
+bun run src/index.ts
 
 # Clear authentication and start fresh
 bun run src/index.ts --clear-auth
@@ -172,6 +212,8 @@ bun run src/index.ts --auth
 ## Usage Examples
 
 ### With curl
+
+> **Note**: Replace `8069` with your configured port if different.
 
 ```bash
 # Chat completion
@@ -196,6 +238,8 @@ curl http://localhost:8069/auth/status
 
 ### With Python (OpenAI library)
 
+> **Note**: Replace `8069` with your configured port if different.
+
 ```python
 import openai
 
@@ -217,6 +261,8 @@ print(response.choices[0].message.content)
 ```
 
 ### With JavaScript/Node.js
+
+> **Note**: Replace `8069` with your configured port if different.
 
 ```javascript
 const response = await fetch('http://localhost:8069/v1/chat/completions', {

@@ -64,8 +64,15 @@ fi
 
 # Start the server
 echo "[*] Starting GitHub Copilot API Server..."
-echo "   - Server will be available at: http://localhost:8069"
-echo "   - API endpoint: http://localhost:8069/v1/chat/completions"
+
+# Try to read PORT from .env file if it exists and PORT is not already set
+if [ -z "$PORT" ] && [ -f ".env" ]; then
+    PORT=$(grep "^PORT=" .env 2>/dev/null | cut -d'=' -f2)
+fi
+# Use default if still not set
+PORT=${PORT:-8069}
+echo "   - Server will be available at: http://localhost:${PORT}"
+echo "   - API endpoint: http://localhost:${PORT}/v1/chat/completions"
 echo "   - Press Ctrl+C to stop"
 echo
 

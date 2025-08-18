@@ -55,8 +55,16 @@ if %errorlevel% equ 0 (
 )
 
 echo [*] Starting GitHub Copilot API Server...
-echo    - Server will be available at: http://localhost:8069
-echo    - API endpoint: http://localhost:8069/v1/chat/completions
+
+REM Try to read PORT from .env file if it exists and PORT is not already set
+if not defined PORT (
+    if exist .env (
+        for /f "tokens=2 delims==" %%a in ('findstr "^PORT=" .env 2^>nul') do set PORT=%%a
+    )
+    if not defined PORT set PORT=8069
+)
+echo    - Server will be available at: http://localhost:%PORT%
+echo    - API endpoint: http://localhost:%PORT%/v1/chat/completions
 echo    - Press Ctrl+C to stop
 echo.
 

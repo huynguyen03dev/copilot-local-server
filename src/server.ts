@@ -48,7 +48,10 @@ export class CopilotAPIServer {
   // Server instance for graceful shutdown
   private server: any = null
 
-  constructor(port: number = 8069, hostname: string = "127.0.0.1") {
+  constructor(
+    port: number = parseInt(process.env.PORT || "8069"),
+    hostname: string = process.env.HOSTNAME || "127.0.0.1"
+  ) {
     this.port = port
     this.hostname = hostname
     this.app = new Hono()

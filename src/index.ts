@@ -11,6 +11,17 @@ const helpArg = args.includes("--help") || args.includes("-h")
 const authArg = args.includes("--auth")
 const clearAuthArg = args.includes("--clear-auth")
 
+// Parse port and hostname for use in help text and server startup
+// Port priority: command line arg > environment variable > default (8069)
+const port = portArg
+  ? parseInt(portArg.split("=")[1])
+  : parseInt(process.env.PORT || "8069")
+
+// Hostname priority: command line arg > environment variable > default (127.0.0.1)
+const hostname = hostArg
+  ? hostArg.split("=")[1]
+  : process.env.HOSTNAME || "127.0.0.1"
+
 if (helpArg) {
   console.log(`
 GitHub Copilot API Server
@@ -18,15 +29,20 @@ GitHub Copilot API Server
 Usage: bun run src/index.ts [options]
 
 Options:
-  --port=<number>     Port to listen on (default: 8069)
-  --host=<string>     Hostname to bind to (default: 127.0.0.1)
+  --port=<number>     Port to listen on (current: ${port}, default: 8069)
+  --host=<string>     Hostname to bind to (current: ${hostname}, default: 127.0.0.1)
   --auth              Start interactive authentication flow
   --clear-auth        Clear stored authentication
   --help, -h          Show this help message
 
+Environment Variables:
+  PORT                Server port (current: ${port})
+  HOSTNAME            Server hostname (current: ${hostname})
+
 Examples:
-  bun run src/index.ts                    # Start server on default port
-  bun run src/index.ts --port=8080        # Start server on port 8080
+  bun run src/index.ts                    # Start server with .env settings
+  bun run src/index.ts --port=8080        # Override port via command line
+  PORT=3000 bun run src/index.ts          # Override port via environment
   bun run src/index.ts --auth             # Authenticate with GitHub Copilot
   bun run src/index.ts --clear-auth       # Clear authentication
 
@@ -55,9 +71,6 @@ Troubleshooting Authentication:
 `)
   process.exit(0)
 }
-
-const port = portArg ? parseInt(portArg.split("=")[1]) : 8069
-const hostname = hostArg ? hostArg.split("=")[1] : "127.0.0.1"
 
 async function handleAuth() {
   try {
