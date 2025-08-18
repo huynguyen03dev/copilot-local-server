@@ -74,6 +74,9 @@ export interface APIErrorResponse {
   }
 }
 
+// Alias for backward compatibility
+export interface APIError extends APIErrorResponse {}
+
 // Zod schemas for runtime validation
 export const BaseErrorSchema = z.object({
   code: z.string(),
@@ -225,6 +228,25 @@ export function toAPIErrorResponse(error: APIErrorType): APIErrorResponse {
       message: error.message,
       type: error.code.toLowerCase().replace(/_/g, '_'),
       code: error.code,
+    }
+  }
+}
+
+/**
+ * Create a standardized API error response
+ */
+export function createAPIErrorResponse(
+  message: string,
+  type: string,
+  code?: string,
+  param?: string
+): APIErrorResponse {
+  return {
+    error: {
+      message,
+      type,
+      code,
+      param
     }
   }
 }

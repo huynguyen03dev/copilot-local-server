@@ -38,7 +38,7 @@ export type OAuthInfo = z.infer<typeof OAuthInfo>
 // OpenAI Compatible API Types - Content Block Types
 export const TextContent = z.object({
   type: z.literal("text"),
-  text: z.string(),
+  text: z.string().min(1, "Text content cannot be empty"),
 })
 
 export const ImageContent = z.object({
@@ -53,23 +53,29 @@ export const ContentBlock = z.union([TextContent, ImageContent])
 
 // Updated ChatMessage to support both string and array content formats
 export const ChatMessage = z.object({
-  role: z.enum(["system", "user", "assistant"]),
+  role: z.enum(["system", "user", "assistant"], {
+    errorMap: () => ({ message: "Role must be one of: system, user, assistant" })
+  }),
   content: z.union([
-    z.string(),                    // Legacy string format (backward compatibility)
-    z.array(ContentBlock)          // New array format (multi-modal support)
-  ]),
+    z.string().min(1, "Content cannot be empty"),                    // Legacy string format (backward compatibility)
+    z.array(ContentBlock).min(1, "Content array cannot be empty")   // New array format (multi-modal support)
+  ], {
+    errorMap: () => ({ message: "Content must be a non-empty string or array" })
+  }),
 })
 
 export const ChatCompletionRequest = z.object({
-  model: z.string(),
-  messages: z.array(ChatMessage),
-  temperature: z.number().optional(),
-  max_tokens: z.number().optional(),
+  model: z.string().min(1, "Model is required and cannot be empty"),
+  messages: z.array(ChatMessage).min(1, "Messages array cannot be empty"),
+  temperature: z.number().min(0, "Temperature must be >= 0").max(2, "Temperature must be <= 2").optional(),
+  max_tokens: z.number().min(1, "Max tokens must be >= 1").max(100000, "Max tokens must be <= 100000").optional(),
   stream: z.boolean().optional(),
   stream_options: z.object({
     include_usage: z.boolean().optional(),
   }).optional(),
-  top_p: z.number().optional(),
+  top_p: z.number().min(0, "Top-p must be >= 0").max(1, "Top-p must be <= 1").optional(),
+  presence_penalty: z.number().min(-2, "Presence penalty must be >= -2").max(2, "Presence penalty must be <= 2").optional(),
+  frequency_penalty: z.number().min(-2, "Frequency penalty must be >= -2").max(2, "Frequency penalty must be <= 2").optional(),
   stop: z.union([z.string(), z.array(z.string())]).optional(),
 })
 

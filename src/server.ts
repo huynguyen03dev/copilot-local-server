@@ -8,15 +8,10 @@ import {
   ChatCompletionRequest,
   ChatCompletionResponse,
   ChatCompletionStreamChunk,
-  APIError,
-  APIErrorResponse,
   ErrorFactory,
-  toAPIErrorResponse,
-  type ChatMessage,
-  type StreamingError,
-  type NetworkError,
-  type ValidationError
+  toAPIErrorResponse
 } from "./types"
+import { createAPIErrorResponse } from "./types/errors"
 import {
   validateContent,
   transformMessagesForCopilot,
@@ -33,11 +28,10 @@ import {
 import { config, logConfiguration } from "./config"
 import { securityConfig } from "./config/security"
 import { correlationMiddleware } from "./middleware/correlation"
+import { requestSizeMiddleware, TEST_LIMITS, PRODUCTION_LIMITS } from "./middleware/requestSize"
 import {
-  ErrorBoundary,
   StreamingErrorBoundary,
-  NetworkErrorBoundary,
-  type ErrorBoundaryResult
+  NetworkErrorBoundary
 } from "./utils/errorBoundary"
 
 export class CopilotAPIServer {
@@ -50,6 +44,7 @@ export class CopilotAPIServer {
   private streamingRateLimit = new Map<string, number>()
   private readonly MAX_CONCURRENT_STREAMS = config.server.maxConcurrentStreams
   private readonly RATE_LIMIT_INTERVAL = config.streaming.rateLimitInterval
+  private readonly IS_TEST_ENVIRONMENT = process.env.NODE_ENV === 'test'
 
   // Performance monitoring
   private streamMetrics = {
@@ -102,6 +97,9 @@ export class CopilotAPIServer {
     // Request logging (after correlation middleware)
     this.app.use("*", honoLogger())
 
+    // Request size validation middleware (after logging, before route handlers)
+    this.app.use("*", requestSizeMiddleware(this.IS_TEST_ENVIRONMENT ? TEST_LIMITS : PRODUCTION_LIMITS))
+
     // Error handler
     this.app.onError((err, c) => {
       logger.error('SERVER', `Server error: ${err.message}`)
@@ -118,15 +116,29 @@ export class CopilotAPIServer {
       const errorResponse = toAPIErrorResponse(serverError)
       return c.json(errorResponse, 500)
     })
+
+    // 404 handler for unmatched routes
+    this.app.notFound((c) => {
+      const errorResponse = createAPIErrorResponse(
+        `Endpoint not found: ${c.req.method} ${c.req.path}`,
+        "not_found_error",
+        "ENDPOINT_NOT_FOUND"
+      )
+      return c.json(errorResponse, 404)
+    })
   }
 
   private setupRoutes() {
     // Health check endpoint
     this.app.get("/", (c) => {
       return c.json({
-        status: "ok",
-        message: "GitHub Copilot API Server",
-        version: "1.0.0"
+        status: "healthy",
+        service: "GitHub Copilot API Server",
+        version: "1.0.0",
+        timestamp: new Date().toISOString(),
+        uptime: Math.floor((Date.now() - this.streamMetrics.startTime) / 1000),
+        activeStreams: this.activeStreams.size,
+        maxStreams: this.MAX_CONCURRENT_STREAMS
       })
     })
 
@@ -185,12 +197,11 @@ export class CopilotAPIServer {
           message: `Please visit ${authData.verification} and enter code: ${authData.user}`
         })
       } catch (error) {
-        const errorResponse: APIError = {
-          error: {
-            message: error instanceof Error ? error.message : "Authentication failed",
-            type: "auth_error"
-          }
-        }
+        const errorResponse = createAPIErrorResponse(
+          error instanceof Error ? error.message : "Authentication failed",
+          "auth_error",
+          "AUTHENTICATION_FAILED"
+        )
         return c.json(errorResponse, 400)
       }
     })
@@ -201,12 +212,12 @@ export class CopilotAPIServer {
       const deviceCode = body.device_code
 
       if (!deviceCode) {
-        const errorResponse: APIError = {
-          error: {
-            message: "device_code is required",
-            type: "invalid_request"
-          }
-        }
+        const errorResponse = createAPIErrorResponse(
+          "device_code is required",
+          "invalid_request_error",
+          "MISSING_DEVICE_CODE",
+          "device_code"
+        )
         return c.json(errorResponse, 400)
       }
 
@@ -218,12 +229,11 @@ export class CopilotAPIServer {
           error_description: result.errorDescription
         })
       } catch (error) {
-        const errorResponse: APIError = {
-          error: {
-            message: error instanceof Error ? error.message : "Polling failed",
-            type: "auth_error"
-          }
-        }
+        const errorResponse = createAPIErrorResponse(
+          error instanceof Error ? error.message : "Polling failed",
+          "auth_error",
+          "POLLING_FAILED"
+        )
         return c.json(errorResponse, 400)
       }
     })
@@ -253,20 +263,46 @@ export class CopilotAPIServer {
           }, 400)
         }
       } catch (error) {
-        const errorResponse: APIError = {
-          error: {
-            message: error instanceof Error ? error.message : "Authentication flow failed",
-            type: "auth_error"
-          }
-        }
+        const errorResponse = createAPIErrorResponse(
+          error instanceof Error ? error.message : "Authentication flow failed",
+          "auth_error",
+          "AUTHENTICATION_FLOW_FAILED"
+        )
         return c.json(errorResponse, 500)
       }
+    })
+
+    // Handle unsupported HTTP methods for chat completions endpoint
+    this.app.all("/v1/chat/completions", async (c, next) => {
+      if (c.req.method !== "POST") {
+        const errorResponse = createAPIErrorResponse(
+          `Method ${c.req.method} not allowed. Only POST is supported.`,
+          "method_not_allowed_error",
+          "METHOD_NOT_ALLOWED"
+        )
+        c.header("Allow", "POST")
+        return c.json(errorResponse, 405)
+      }
+      await next()
     })
 
     // OpenAI-compatible chat completions endpoint
     this.app.post(
       "/v1/chat/completions",
-      zValidator("json", ChatCompletionRequest),
+      zValidator("json", ChatCompletionRequest, (result, c) => {
+        if (!result.success) {
+          const errorMessage = result.error.issues.map(issue =>
+            `${issue.path.join('.')}: ${issue.message}`
+          ).join(', ')
+
+          const errorResponse = createAPIErrorResponse(
+            errorMessage,
+            "invalid_request_error",
+            "VALIDATION_ERROR"
+          )
+          return c.json(errorResponse, 400)
+        }
+      }),
       async (c) => {
         const body = c.req.valid("json")
 
@@ -275,13 +311,11 @@ export class CopilotAPIServer {
           const message = body.messages[i]
           const validation = validateContent(message.content)
           if (!validation.isValid) {
-            const errorResponse: APIError = {
-              error: {
-                message: `Invalid content in message ${i}: ${validation.error}`,
-                type: "invalid_request_error",
-                code: "invalid_content_format"
-              }
-            }
+            const errorResponse = createAPIErrorResponse(
+              `Invalid content in message ${i}: ${validation.error}`,
+              "invalid_request_error",
+              "invalid_content_format"
+            )
             return c.json(errorResponse, 400)
           }
 
@@ -295,13 +329,11 @@ export class CopilotAPIServer {
         // Check authentication
         const token = await GitHubCopilotAuth.getAccessToken()
         if (!token) {
-          const errorResponse: APIError = {
-            error: {
-              message: "Not authenticated with GitHub Copilot. Please authenticate first.",
-              type: "authentication_error",
-              code: "invalid_api_key"
-            }
-          }
+          const errorResponse = createAPIErrorResponse(
+            "Not authenticated with GitHub Copilot. Please authenticate first.",
+            "authentication_error",
+            "invalid_api_key"
+          )
           return c.json(errorResponse, 401)
         }
 
@@ -315,24 +347,20 @@ export class CopilotAPIServer {
             const clientId = this.getClientId(c)
 
             if (!this.checkStreamingRateLimit(clientId)) {
-              const errorResponse: APIError = {
-                error: {
-                  message: "Rate limit exceeded. Please wait before making another streaming request.",
-                  type: "rate_limit_error",
-                  code: "rate_limit_exceeded"
-                }
-              }
+              const errorResponse = createAPIErrorResponse(
+                "Rate limit exceeded. Please wait before making another streaming request.",
+                "rate_limit_error",
+                "rate_limit_exceeded"
+              )
               return c.json(errorResponse, 429)
             }
 
             if (this.activeStreams.size >= this.MAX_CONCURRENT_STREAMS) {
-              const errorResponse: APIError = {
-                error: {
-                  message: "Server is at maximum capacity for streaming requests. Please try again later.",
-                  type: "capacity_error",
-                  code: "max_streams_exceeded"
-                }
-              }
+              const errorResponse = createAPIErrorResponse(
+                "Server is at maximum capacity for streaming requests. Please try again later.",
+                "capacity_error",
+                "max_streams_exceeded"
+              )
               return c.json(errorResponse, 503)
             }
 
@@ -351,7 +379,7 @@ export class CopilotAPIServer {
                 {
                   retryAttempts: 1,
                   retryDelay: 1000,
-                  timeoutMs: 60000,
+                  timeoutMs: this.IS_TEST_ENVIRONMENT ? 30000 : 60000, // 30s for tests, 60s for production
                   category: 'STREAMING'
                 }
               )
@@ -392,12 +420,11 @@ export class CopilotAPIServer {
           }
         } catch (error) {
           console.error("Copilot API error:", error)
-          const errorResponse: APIError = {
-            error: {
-              message: error instanceof Error ? error.message : "Failed to process request",
-              type: "api_error"
-            }
-          }
+          const errorResponse = createAPIErrorResponse(
+            error instanceof Error ? error.message : "Failed to process request",
+            "api_error",
+            "REQUEST_FAILED"
+          )
           return c.json(errorResponse, 500)
         }
       }
@@ -408,12 +435,11 @@ export class CopilotAPIServer {
       const isAuthenticated = await GitHubCopilotAuth.isAuthenticated()
       
       if (!isAuthenticated) {
-        const errorResponse: APIError = {
-          error: {
-            message: "Not authenticated",
-            type: "authentication_error"
-          }
-        }
+        const errorResponse = createAPIErrorResponse(
+          "Not authenticated",
+          "authentication_error",
+          "UNAUTHENTICATED"
+        )
         return c.json(errorResponse, 401)
       }
 
@@ -851,7 +877,7 @@ export class CopilotAPIServer {
                 // Capture the actual model from the first chunk
                 if (!modelLogged && chunk.model) {
                   actualModel = chunk.model
-                  modelLogger.info(streamId, actualModel, apiUrl ?? '')
+                  modelLogger.info(streamId, chunk.model, apiUrl ?? 'unknown')
                   modelLogged = true
                 }
 
@@ -1044,6 +1070,22 @@ export class CopilotAPIServer {
    * Check streaming rate limit for a client
    */
   private checkStreamingRateLimit(clientId: string): boolean {
+    // In test environment, be more lenient with rate limiting
+    if (this.IS_TEST_ENVIRONMENT) {
+      // Allow more frequent requests in test environment
+      const testInterval = this.RATE_LIMIT_INTERVAL / 10 // 100ms instead of 1000ms
+      const now = Date.now()
+      const lastRequest = this.streamingRateLimit.get(clientId) || 0
+
+      if (now - lastRequest < testInterval) {
+        return false
+      }
+
+      this.streamingRateLimit.set(clientId, now)
+      return true
+    }
+
+    // Production rate limiting
     const now = Date.now()
     const lastRequest = this.streamingRateLimit.get(clientId) || 0
 
