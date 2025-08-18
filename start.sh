@@ -30,39 +30,19 @@ fi
 
 # Check authentication status
 echo "[?] Checking authentication status..."
-AUTH_STATUS=$(bun run -e "
-    import { GitHubCopilotAuth } from './src/auth.ts';
-    const isAuth = await GitHubCopilotAuth.isAuthenticated();
-    console.log(isAuth ? 'authenticated' : 'not-authenticated');
-" 2>/dev/null || echo "unknown")
-
-if [ "$AUTH_STATUS" = "authenticated" ]; then
+if bun run test-auth.js >/dev/null 2>&1; then
     echo "[OK] Already authenticated with GitHub Copilot"
     echo
-elif [ "$AUTH_STATUS" = "not-authenticated" ]; then
+else
     echo "[!] Not authenticated with GitHub Copilot"
-    echo
-    echo "To authenticate:"
-    echo "  1. Run: bun run auth"
-    echo "  2. Follow the instructions to authenticate with GitHub"
-    echo "  3. Then start the server with: bun run start"
+    echo "[*] Starting seamless authentication and server..."
     echo
 
-    read -p "Would you like to start authentication now? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo "Starting authentication flow..."
-        bun run src/index.ts --auth
-        echo
-        echo "Authentication complete! Now starting server..."
-        echo
-    fi
-else
-    echo "[!] Could not check authentication status"
-    echo
+    # Use the --auto-auth flag for seamless experience
+    exec bun run src/index.ts --auto-auth "$@"
 fi
 
-# Start the server
+# If we reach here, user is already authenticated, so start normally
 echo "[*] Starting GitHub Copilot API Server..."
 
 # Try to read PORT from .env file if it exists and PORT is not already set

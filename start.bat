@@ -30,30 +30,22 @@ if not exist "node_modules" (
 
 REM Check authentication status first
 echo [?] Checking authentication status...
-bun run -e "import { GitHubCopilotAuth } from './src/auth.ts'; const isAuth = await GitHubCopilotAuth.isAuthenticated(); process.exit(isAuth ? 0 : 1);" >nul 2>&1
+bun run test-auth.js >nul 2>&1
 
 if %errorlevel% equ 0 (
     echo [OK] Already authenticated with GitHub Copilot
     echo.
 ) else (
     echo [!] Not authenticated with GitHub Copilot
-    echo.
-    echo To authenticate:
-    echo   1. Run: bun run auth
-    echo   2. Follow the instructions to authenticate with GitHub
-    echo   3. Then start the server with: bun run start
+    echo [*] Starting seamless authentication and server...
     echo.
 
-    set /p choice="Would you like to start authentication now? (y/N): "
-    if /i "%choice%"=="y" (
-        echo Starting authentication flow...
-        bun run src/index.ts --auth
-        echo.
-        echo Authentication complete! Now starting server...
-        echo.
-    )
+    REM Use the --auto-auth flag for seamless experience
+    bun run src/index.ts --auto-auth %*
+    exit /b %errorlevel%
 )
 
+REM If we reach here, user is already authenticated, so start normally
 echo [*] Starting GitHub Copilot API Server...
 
 REM Try to read PORT from .env file if it exists and PORT is not already set

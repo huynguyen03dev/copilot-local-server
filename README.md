@@ -30,7 +30,7 @@ A local API server that exposes GitHub Copilot as an OpenAI-compatible endpoint.
 
 ## Quick Start
 
-### Method 1: Using Startup Scripts (Recommended)
+### Method 1: One-Click Startup (Recommended) 🚀
 
 **Windows:**
 ```batch
@@ -42,30 +42,47 @@ start.bat
 ./start.sh
 ```
 
-These scripts will:
-- Check if Bun is installed
-- Install dependencies if needed
-- Check authentication status automatically
-- Prompt for authentication only if needed
-- Start the server
+**✨ Completely Automated Experience:**
+- ✅ Checks if Bun is installed
+- ✅ Installs dependencies automatically
+- ✅ Detects authentication status
+- ✅ **Automatically opens browser for GitHub OAuth**
+- ✅ **Handles entire authentication flow seamlessly**
+- ✅ Starts server immediately after authentication
+- ✅ **No manual steps required!**
 
-### Method 2: Using Package Scripts
+Just run the script and your browser will open for authentication. The server starts automatically once you approve the GitHub OAuth request.
+
+### Method 2: Seamless Command Line
 
 ```bash
-# Authenticate (only needed once)
+# One command that handles everything automatically
+bun run src/index.ts --auto-auth
+```
+
+This will:
+- ✅ Check authentication status
+- ✅ Open browser for OAuth if needed
+- ✅ Wait for authentication completion
+- ✅ Start server immediately
+
+### Method 3: Manual Steps (Traditional)
+
+```bash
+# Step 1: Authenticate (only needed once)
 bun run auth
 
-# Start the server
+# Step 2: Start the server
 bun run start
 ```
 
-### Method 3: Direct Command
+### Method 4: Individual Commands
 
 ```bash
-# Authenticate first (if not already done)
+# Interactive authentication
 bun run src/index.ts --auth
 
-# Start the server
+# Start server (will warn if not authenticated)
 bun run src/index.ts
 ```
 

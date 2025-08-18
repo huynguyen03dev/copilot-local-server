@@ -10,6 +10,7 @@ const hostArg = args.find(arg => arg.startsWith("--host="))
 const helpArg = args.includes("--help") || args.includes("-h")
 const authArg = args.includes("--auth")
 const clearAuthArg = args.includes("--clear-auth")
+const autoAuthArg = args.includes("--auto-auth")
 
 // Parse port and hostname for use in help text and server startup
 // Port priority: command line arg > environment variable > default (8069)
@@ -32,6 +33,7 @@ Options:
   --port=<number>     Port to listen on (current: ${port}, default: 8069)
   --host=<string>     Hostname to bind to (current: ${hostname}, default: 127.0.0.1)
   --auth              Start interactive authentication flow
+  --auto-auth         Automatically authenticate and start server (seamless)
   --clear-auth        Clear stored authentication
   --help, -h          Show this help message
 
@@ -138,8 +140,11 @@ async function startServer() {
 
     if (!isAuthenticated) {
       console.log("⚠️  Not authenticated with GitHub Copilot")
-      console.log("Run with --auth flag to authenticate first:")
-      console.log(`bun run src/index.ts --auth\n`)
+      console.log("\n💡 Quick options:")
+      console.log("   • For seamless authentication: bun run src/index.ts --auto-auth")
+      console.log("   • For manual authentication: bun run src/index.ts --auth")
+      console.log("   • Or use the startup scripts: ./start.sh or start.bat")
+      console.log("\n⚠️  Server will start but API calls will fail without authentication\n")
     } else {
       console.log("✅ Authenticated with GitHub Copilot")
     }
@@ -164,12 +169,46 @@ async function startServer() {
   })
 }
 
+async function handleAutoAuth() {
+  try {
+    console.log("🚀 Starting seamless authentication and server startup...")
+
+    // Check if already authenticated
+    const isAuthenticated = await GitHubCopilotAuth.isAuthenticated()
+    if (isAuthenticated) {
+      console.log("✅ Already authenticated with GitHub Copilot")
+    } else {
+      console.log("🔐 Not authenticated - starting automatic authentication...")
+      const result = await GitHubCopilotAuth.authenticateSeamlessly()
+
+      if (!result.success) {
+        console.error("❌ Automatic authentication failed:", result.error)
+        if (result.errorDescription) {
+          console.error("   Details:", result.errorDescription)
+        }
+        console.log("\n💡 You can try manual authentication with: bun run auth")
+        process.exit(1)
+      }
+    }
+
+    // Start the server
+    console.log("🚀 Starting server...")
+    await startServer()
+  } catch (error) {
+    console.error("❌ Failed to start with auto-authentication:", error)
+    console.log("\n💡 Try manual authentication: bun run auth")
+    process.exit(1)
+  }
+}
+
 // Main execution
 async function main() {
   if (clearAuthArg) {
     await handleClearAuth()
   } else if (authArg) {
     await handleAuth()
+  } else if (autoAuthArg) {
+    await handleAutoAuth()
   } else {
     await startServer()
   }

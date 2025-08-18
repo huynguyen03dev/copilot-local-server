@@ -1,11 +1,12 @@
 import path from "path"
 import fs from "fs/promises"
 import { z } from "zod"
-import type { 
-  DeviceCodeResponse, 
-  AccessTokenResponse, 
-  CopilotTokenResponse, 
-  OAuthInfo 
+import { spawn } from "child_process"
+import type {
+  DeviceCodeResponse,
+  AccessTokenResponse,
+  CopilotTokenResponse,
+  OAuthInfo
 } from "./types"
 
 export class GitHubCopilotAuth {
@@ -14,6 +15,43 @@ export class GitHubCopilotAuth {
   private static readonly ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
   private static readonly COPILOT_API_KEY_URL = "https://api.github.com/copilot_internal/v2/token"
   private static readonly AUTH_FILE = path.join(process.cwd(), ".auth.json")
+
+  /**
+   * Automatically open URL in default browser
+   */
+  private static async openBrowser(url: string): Promise<boolean> {
+    try {
+      const platform = process.platform
+      let command: string
+      let args: string[]
+
+      switch (platform) {
+        case 'darwin': // macOS
+          command = 'open'
+          args = [url]
+          break
+        case 'win32': // Windows
+          command = 'cmd'
+          args = ['/c', 'start', '""', url]
+          break
+        default: // Linux and others
+          command = 'xdg-open'
+          args = [url]
+          break
+      }
+
+      const child = spawn(command, args, {
+        detached: true,
+        stdio: 'ignore'
+      })
+      child.unref()
+
+      return true
+    } catch (error) {
+      console.warn(`Failed to open browser automatically: ${error}`)
+      return false
+    }
+  }
 
   /**
    * Start the OAuth device flow
@@ -227,6 +265,107 @@ export class GitHubCopilotAuth {
   }
 
   /**
+   * Seamless authentication flow for startup scripts
+   * Automatically handles the entire flow without user prompts
+   */
+  static async authenticateSeamlessly(): Promise<{
+    success: boolean
+    error?: string
+    errorDescription?: string
+  }> {
+    try {
+      console.log("🔐 Authenticating with GitHub Copilot...")
+
+      // Step 1: Get device code
+      const authData = await this.authorize()
+
+      console.log(`🌐 Opening browser for authentication...`)
+      console.log(`🔑 Device code: ${authData.user}`)
+
+      // Step 2: Automatically open browser
+      const browserOpened = await this.openBrowser(authData.verification)
+      if (browserOpened) {
+        console.log("✅ Browser opened - please complete authentication")
+      } else {
+        console.log(`⚠️  Please manually visit: ${authData.verification}`)
+        console.log(`🔑 Enter code: ${authData.user}`)
+      }
+
+      console.log("⏳ Waiting for authentication (this may take a few minutes)...")
+
+      // Step 3: Poll for completion with minimal output
+      const startTime = Date.now()
+      const expiryTime = startTime + (authData.expiry * 1000)
+      let attempts = 0
+      let currentInterval = authData.interval
+
+      return new Promise((resolve) => {
+        const poll = async () => {
+          attempts++
+          const elapsed = Date.now() - startTime
+          const remaining = Math.max(0, expiryTime - Date.now())
+
+          if (remaining <= 0) {
+            console.log("\n⏰ Authentication timed out")
+            resolve({
+              success: false,
+              error: "timeout",
+              errorDescription: "Authentication request expired"
+            })
+            return
+          }
+
+          // Show progress every 30 seconds
+          if (attempts % 6 === 0) {
+            const remainingMinutes = Math.ceil(remaining / 60000)
+            console.log(`⏳ Still waiting... (${remainingMinutes} minutes remaining)`)
+          }
+
+          try {
+            const result = await this.poll(authData.device)
+
+            if (result.status === "complete") {
+              console.log("✅ Authentication successful!")
+              resolve({ success: true })
+              return
+            } else if (result.status === "failed" || result.status === "expired" || result.status === "access_denied") {
+              console.log(`❌ Authentication failed: ${result.errorDescription || result.error}`)
+              resolve({
+                success: false,
+                error: result.error,
+                errorDescription: result.errorDescription
+              })
+              return
+            } else if (result.status === "pending") {
+              // Handle slow_down by increasing interval
+              if (result.error === "slow_down") {
+                currentInterval = Math.min(currentInterval * 2, 30)
+              }
+              setTimeout(poll, currentInterval * 1000)
+            }
+          } catch (error) {
+            console.log(`❌ Authentication error: ${error}`)
+            resolve({
+              success: false,
+              error: "network_error",
+              errorDescription: error instanceof Error ? error.message : "Unknown error"
+            })
+          }
+        }
+
+        // Start polling
+        setTimeout(poll, currentInterval * 1000)
+      })
+    } catch (error) {
+      return {
+        success: false,
+        error: "initialization_error",
+        errorDescription: error instanceof Error ? error.message : "Failed to start authentication"
+      }
+    }
+  }
+
+  /**
    * Complete authentication flow with improved UX
    */
   static async authenticateWithFlow(): Promise<{
@@ -241,10 +380,22 @@ export class GitHubCopilotAuth {
       const authData = await this.authorize()
 
       console.log("\n📋 Authentication Instructions:")
-      console.log(`1. Visit: ${authData.verification}`)
-      console.log(`2. Enter code: ${authData.user}`)
-      console.log(`3. Authorize the application`)
-      console.log(`4. Return here and wait for confirmation\n`)
+      console.log(`🌐 Opening browser to: ${authData.verification}`)
+      console.log(`🔑 Your device code: ${authData.user}`)
+      console.log(`⏱️  Code expires in ${Math.floor(authData.expiry / 60)} minutes\n`)
+
+      // Step 1.5: Automatically open browser
+      const browserOpened = await this.openBrowser(authData.verification)
+      if (browserOpened) {
+        console.log("✅ Browser opened automatically")
+        console.log(`💡 If the page didn't load, manually visit: ${authData.verification}`)
+      } else {
+        console.log("⚠️  Could not open browser automatically")
+        console.log(`🔗 Please manually visit: ${authData.verification}`)
+      }
+
+      console.log(`\n🔑 Enter this code in your browser: ${authData.user}`)
+      console.log("⏳ Waiting for you to complete authentication...\n")
 
       // Step 2: Poll with improved timing and UX
       const startTime = Date.now()
