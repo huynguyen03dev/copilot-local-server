@@ -81,8 +81,8 @@ export const defaultProductionConfig: ProductionConfig = {
   performance: {
     enableGarbageCollection: process.env.ENABLE_GC !== "false",
     memoryThresholdMB: parseInt(process.env.MEMORY_THRESHOLD_MB || "1000"), // 1GB
-    enableCompression: process.env.ENABLE_COMPRESSION !== "false",
-    cacheHeaders: process.env.CACHE_HEADERS !== "false",
+    enableCompression: process.env.ENABLE_COMPRESSION !== "false", // Default to true for better performance
+    cacheHeaders: process.env.CACHE_HEADERS !== "false", // Default to true for better client-side caching
   }
 }
 

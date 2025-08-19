@@ -22,7 +22,7 @@ export interface EndpointConfig {
 
 export class EndpointCacheManager {
   private cache = new Map<string, CachedEndpoint>()
-  private readonly CACHE_TTL = 300000 // 5 minutes
+  private readonly CACHE_TTL = 900000 // 15 minutes (increased from 5 minutes for better performance)
   private readonly MAX_FAILURE_COUNT = 3
   private readonly HEALTH_CHECK_INTERVAL = 60000 // 1 minute
 

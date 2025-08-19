@@ -54,8 +54,8 @@ const MonitoringConfigSchema = z.object({
 })
 
 const PerformanceConfigSchema = z.object({
-  enableCompression: z.boolean().default(false),
-  cacheHeaders: z.boolean().default(false),
+  enableCompression: z.boolean().default(true), // Enable compression by default for better performance
+  cacheHeaders: z.boolean().default(true), // Enable cache headers by default for better client-side caching
   maxMemoryUsage: z.number().min(100).default(1000), // 1GB
   gcThreshold: z.number().min(0.1).max(1.0).default(0.8), // 80%
   enableEndpointCache: z.boolean().default(true),
@@ -147,8 +147,8 @@ function parseEnvironmentConfig(): Config {
       enableGarbageCollection: parseBoolean(env.ENABLE_GC, false),
     },
     performance: {
-      enableCompression: parseBoolean(env.ENABLE_COMPRESSION, false),
-      cacheHeaders: parseBoolean(env.CACHE_HEADERS, false),
+      enableCompression: parseBoolean(env.ENABLE_COMPRESSION, true), // Default to true for better performance
+      cacheHeaders: parseBoolean(env.CACHE_HEADERS, true), // Default to true for better client-side caching
       maxMemoryUsage: parseInteger(env.MAX_MEMORY_MB, 1000),
       gcThreshold: parseFloat(env.GC_THRESHOLD || '0.8'),
       enableEndpointCache: parseBoolean(env.ENABLE_ENDPOINT_CACHE, true),
