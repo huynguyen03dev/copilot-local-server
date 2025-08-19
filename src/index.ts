@@ -156,7 +156,7 @@ async function startServer() {
 
   // Start the server
   const server = new CopilotAPIServer(port, hostname)
-  server.start()
+  await server.start()
 
   // Handle graceful shutdown
   process.on("SIGINT", () => {

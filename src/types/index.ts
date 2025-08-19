@@ -2,11 +2,29 @@
  * Type definitions and exports
  */
 
-// Export all error types and utilities
-export * from "./errors"
+// Export specific error types and utilities
+export {
+  ErrorFactory,
+  isAPIError,
+  toAPIErrorResponse,
+  formatErrorForLogging,
+  isAuthenticationError,
+  isStreamingError,
+  isValidationError,
+  isNetworkError,
+  isConfigurationError
+} from "./errors"
 
-// Export all HTTP types and utilities  
-export * from "./http"
+// Export specific HTTP types and utilities
+export {
+  isHTTPMethod,
+  isSuccessStatus,
+  isClientError,
+  isRedirect,
+  parseContentType,
+  buildQueryString,
+  parseUserAgent
+} from "./http"
 
 // Re-export commonly used types for convenience
 export type {
@@ -22,7 +40,5 @@ export type {
 
 export type {
   HTTPMethod,
-  HTTPStatusCode,
-  ContentType,
-  UserAgent
+  HTTPStatusCode
 } from "./http"

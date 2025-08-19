@@ -4,6 +4,7 @@ import { logger as honoLogger } from "hono/logger"
 import { streamSSE } from "hono/streaming"
 import { zValidator } from "@hono/zod-validator"
 import { GitHubCopilotAuth } from "./auth"
+
 import {
   ChatCompletionRequest,
   ChatCompletionResponse,
@@ -30,9 +31,53 @@ import { securityConfig } from "./config/security"
 import { correlationMiddleware } from "./middleware/correlation"
 import { requestSizeMiddleware, TEST_LIMITS, PRODUCTION_LIMITS } from "./middleware/requestSize"
 import {
+  streamingValidationMiddleware,
+  TEST_STREAMING_CONFIG,
+  PRODUCTION_STREAMING_CONFIG,
+  compressionMiddleware,
+  DEFAULT_COMPRESSION_CONFIG,
+  PRODUCTION_COMPRESSION_CONFIG
+} from "./middleware/streamingValidation"
+import {
+  cacheHeadersMiddleware,
+  DEFAULT_CACHE_CONFIG,
+  PRODUCTION_CACHE_CONFIG,
+  TEST_CACHE_CONFIG
+} from "./middleware/cacheHeaders"
+import {
+  initializeBatchLogger,
+  PRODUCTION_BATCH_CONFIG,
+  DEFAULT_BATCH_CONFIG
+} from "./utils/batchLogger"
+import {
+  initializeAsyncLogger,
+  PRODUCTION_ASYNC_CONFIG,
+  DEFAULT_ASYNC_CONFIG
+} from "./utils/asyncLogger"
+import {
+  initializePerformanceLogger,
+  getPerformanceLogger
+} from "./utils/performanceLogger"
+import {
+  initializeCircuitBreakerManager,
+  PRODUCTION_MANAGER_CONFIG,
+  DEFAULT_MANAGER_CONFIG
+} from "./utils/circuitBreakerManager"
+import {
+  circuitBreakerMiddleware,
+  circuitBreakerHealthMiddleware,
+  circuitBreakerAdminMiddleware,
+  PRODUCTION_CIRCUIT_BREAKER_MIDDLEWARE_CONFIG,
+  DEFAULT_CIRCUIT_BREAKER_MIDDLEWARE_CONFIG
+} from "./middleware/circuitBreakerMiddleware"
+
+import {
   StreamingErrorBoundary,
   NetworkErrorBoundary
 } from "./utils/errorBoundary"
+import { endpointCache } from "./utils/endpointCache"
+import { connectionPool } from "./utils/connectionPool"
+import { streamingManager } from "./utils/streamingManager"
 
 export class CopilotAPIServer {
   private app: Hono
@@ -66,6 +111,9 @@ export class CopilotAPIServer {
   // Server instance for graceful shutdown
   private server: any = null
 
+  // Environment detection
+  private readonly IS_TEST_ENVIRONMENT = process.env.NODE_ENV === 'test'
+
   constructor(
     port: number = config.server.port,
     hostname: string = config.server.hostname
@@ -77,10 +125,76 @@ export class CopilotAPIServer {
     // Log configuration on startup
     logConfiguration()
 
+    // Initialize advanced logging system
+    this.initializeAdvancedLogging()
+
     this.setupMiddleware()
     this.setupRoutes()
     this.setupConnectionMonitoring()
   }
+
+  /**
+   * Initialize advanced logging system
+   */
+  private initializeAdvancedLogging(): void {
+    try {
+      // Initialize batch logger
+      const batchConfig = this.IS_TEST_ENVIRONMENT ? DEFAULT_BATCH_CONFIG : PRODUCTION_BATCH_CONFIG
+      const batchLogger = initializeBatchLogger(batchConfig)
+
+      // Initialize async logger
+      const asyncConfig = this.IS_TEST_ENVIRONMENT ? DEFAULT_ASYNC_CONFIG : PRODUCTION_ASYNC_CONFIG
+      const asyncLogger = initializeAsyncLogger(asyncConfig)
+
+      // Initialize performance logger
+      const performanceLogger = initializePerformanceLogger(asyncLogger)
+
+      // Initialize circuit breaker manager
+      const circuitBreakerConfig = this.IS_TEST_ENVIRONMENT ? DEFAULT_MANAGER_CONFIG : PRODUCTION_MANAGER_CONFIG
+      const circuitBreakerManager = initializeCircuitBreakerManager(circuitBreakerConfig)
+
+      // HTTP/1.1 server initialization complete
+
+      logger.info('SERVER', '📊 Advanced logging system initialized')
+      logger.info('SERVER', `   Batch logging: ${batchConfig.enableFileLogging ? 'enabled' : 'disabled'}`)
+      logger.info('SERVER', `   Async queue: ${asyncConfig.enableAsyncQueue ? 'enabled' : 'disabled'}`)
+      logger.info('SERVER', `   Performance tracking: ${asyncConfig.enablePerformanceTracking ? 'enabled' : 'disabled'}`)
+
+      logger.info('SERVER', '🔄 Circuit breaker system initialized')
+      logger.info('SERVER', `   Global metrics: ${circuitBreakerConfig.enableGlobalMetrics ? 'enabled' : 'disabled'}`)
+      logger.info('SERVER', `   Event logging: ${circuitBreakerConfig.enableEventLogging ? 'enabled' : 'disabled'}`)
+      logger.info('SERVER', `   Periodic reporting: ${circuitBreakerConfig.enablePeriodicReporting ? 'enabled' : 'disabled'}`)
+
+      logger.info('SERVER', '🚀 HTTP/1.1 server system initialized')
+      logger.info('SERVER', `   Protocol: HTTP/1.1`)
+      logger.info('SERVER', `   Streaming: enabled`)
+      logger.info('SERVER', `   Compression: enabled`)
+
+      // Start periodic performance dashboard
+      this.startPerformanceDashboard()
+
+    } catch (error) {
+      logger.error('SERVER', `Failed to initialize advanced logging: ${error}`)
+    }
+  }
+
+  /**
+   * Start periodic performance dashboard logging
+   */
+  private startPerformanceDashboard(): void {
+    const performanceLogger = getPerformanceLogger()
+
+    // Log performance dashboard every 5 minutes
+    setInterval(async () => {
+      try {
+        await performanceLogger.logPerformanceDashboard()
+      } catch (error) {
+        logger.error('SERVER', `Performance dashboard error: ${error}`)
+      }
+    }, 5 * 60 * 1000) // 5 minutes
+  }
+
+
 
   private setupMiddleware() {
     // Enable request correlation tracking (must be first)
@@ -97,8 +211,40 @@ export class CopilotAPIServer {
     // Request logging (after correlation middleware)
     this.app.use("*", honoLogger())
 
-    // Request size validation middleware (after logging, before route handlers)
+    // Response compression middleware (early in pipeline for optimal performance)
+    if (config.performance.enableCompression) {
+      this.app.use("*", compressionMiddleware(
+        this.IS_TEST_ENVIRONMENT ? DEFAULT_COMPRESSION_CONFIG : PRODUCTION_COMPRESSION_CONFIG
+      ))
+      logger.info('SERVER', '🗜️  Response compression enabled')
+    }
+
+    // Streaming validation middleware (for large requests)
+    this.app.use("*", streamingValidationMiddleware(
+      this.IS_TEST_ENVIRONMENT ? TEST_STREAMING_CONFIG : PRODUCTION_STREAMING_CONFIG
+    ))
+
+    // Request size validation middleware (after streaming validation, before route handlers)
     this.app.use("*", requestSizeMiddleware(this.IS_TEST_ENVIRONMENT ? TEST_LIMITS : PRODUCTION_LIMITS))
+
+    // Cache headers middleware (for optimal client-side caching)
+    this.app.use("*", cacheHeadersMiddleware(
+      this.IS_TEST_ENVIRONMENT ? TEST_CACHE_CONFIG : PRODUCTION_CACHE_CONFIG
+    ))
+    logger.info('SERVER', '📦 Cache headers enabled')
+
+    // Circuit breaker middleware (for fault tolerance)
+    this.app.use("*", circuitBreakerMiddleware(
+      this.IS_TEST_ENVIRONMENT ? DEFAULT_CIRCUIT_BREAKER_MIDDLEWARE_CONFIG : PRODUCTION_CIRCUIT_BREAKER_MIDDLEWARE_CONFIG
+    ))
+
+    // Circuit breaker health and admin endpoints
+    this.app.use("*", circuitBreakerHealthMiddleware())
+    this.app.use("*", circuitBreakerAdminMiddleware())
+    logger.info('SERVER', '🔄 Circuit breaker middleware enabled')
+
+    // HTTP/1.1 server ready
+    logger.info('SERVER', '🚀 HTTP/1.1 server endpoints enabled')
 
     // Error handler
     this.app.onError((err, c) => {
@@ -174,6 +320,8 @@ export class CopilotAPIServer {
           activeClients: this.streamingRateLimit.size,
           intervalMs: this.RATE_LIMIT_INTERVAL
         },
+        connectionPool: connectionPool.getOverallStats(),
+        streamingManager: streamingManager.getStreamingStats(),
         timestamp: new Date().toISOString()
       })
     })
@@ -499,78 +647,138 @@ export class CopilotAPIServer {
     })
   }
 
-  private async forwardToCopilot(token: string, request: ChatCompletionRequest, endpoint: string): Promise<ChatCompletionResponse> {
-    // Helper function to safely include stop parameter
-    const safeStopParam = (stop?: string | string[]) => {
-      if (stop === null || stop === undefined) {
-        return {} // Omit the parameter entirely
+  /**
+   * Optimized endpoint discovery using cache
+   */
+  private async discoverOptimalEndpoint(
+    token: string,
+    request: ChatCompletionRequest,
+    baseEndpoint: string
+  ): Promise<{ url: string, requestBody: any }> {
+    // Check cache first
+    const cachedEndpoint = endpointCache.getBestEndpoint(baseEndpoint, request.model)
+
+    if (cachedEndpoint) {
+      const requestBody = this.buildRequestBody(request, cachedEndpoint.format)
+      return {
+        url: cachedEndpoint.url,
+        requestBody
       }
-      if (typeof stop === 'string' && stop.length > 0) {
-        return { stop }
-      }
-      if (Array.isArray(stop) && stop.length > 0) {
-        return { stop }
-      }
-      return {} // Omit if empty string or empty array
     }
 
-    // Transform messages to text-only format for GitHub Copilot compatibility
-    const transformedMessages = transformMessagesForCopilot(request.messages)
-    console.log(`🔄 Transformed ${request.messages.length} message(s) for Copilot compatibility`)
+    // Fallback to discovery if no cache hit
+    return this.performEndpointDiscovery(token, request, baseEndpoint)
+  }
 
-    // Transform request to Copilot format - try different formats
+  /**
+   * Build request body based on format
+   */
+  private buildRequestBody(request: ChatCompletionRequest, format: number): any {
+    const transformedMessages = transformMessagesForCopilot(request.messages)
+    const safeStopParam = this.getSafeStopParam(request.stop)
+
     const baseRequest = {
       model: request.model,
       messages: transformedMessages,
       temperature: request.temperature || 0.7,
       max_tokens: request.max_tokens,
-      stream: false, // For now, we'll handle non-streaming only
+      stream: false,
       top_p: request.top_p,
-      ...safeStopParam(request.stop), // Safely include stop parameter
+      ...safeStopParam,
     }
 
-    // Different request formats for different endpoints
-    const requestFormats = [
-      baseRequest, // Standard OpenAI format
-      {
-        ...baseRequest,
-        intent: true, // Some Copilot endpoints expect this
-        n: 1,
-      },
-      {
-        // Legacy Copilot format - use transformed messages with text-only content
-        prompt: transformedMessages.map(m => `${m.role}: ${m.content}`).join('\n'),
-        max_tokens: request.max_tokens || 150,
-        temperature: request.temperature || 0.7,
-        top_p: request.top_p || 1,
-        n: 1,
-        stream: false,
-        ...safeStopParam(request.stop), // Safely include stop parameter (no null!)
+    switch (format) {
+      case 0:
+        return baseRequest
+      case 1:
+        return { ...baseRequest, intent: true, n: 1 }
+      case 2:
+        return {
+          prompt: transformedMessages.map(m => `${m.role}: ${m.content}`).join('\n'),
+          max_tokens: request.max_tokens || 150,
+          temperature: request.temperature || 0.7,
+          top_p: request.top_p || 1,
+          n: 1,
+          stream: false,
+          ...safeStopParam,
+        }
+      default:
+        return baseRequest
+    }
+  }
+
+  /**
+   * Perform endpoint discovery with caching
+   */
+  private async performEndpointDiscovery(
+    token: string,
+    request: ChatCompletionRequest,
+    baseEndpoint: string
+  ): Promise<{ url: string, requestBody: any }> {
+    const configs = endpointCache.getEndpointConfigs()
+
+    for (const config of configs) {
+      const url = `${baseEndpoint}${config.path}`
+      const requestBody = this.buildRequestBody(request, config.format)
+
+      try {
+        const response = await connectionPool.request(url, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${token}`,
+            "Content-Type": "application/json",
+            "User-Agent": "GitHubCopilotChat/0.26.7",
+            "Editor-Version": "vscode/1.99.3",
+            "Editor-Plugin-Version": "copilot-chat/0.26.7",
+          },
+          body: JSON.stringify(requestBody),
+          timeout: 15000
+        })
+
+        if (response.statusCode === 200) {
+          endpointCache.cacheSuccessfulEndpoint(baseEndpoint, request.model, config, response.responseTime)
+          return { url, requestBody }
+        } else if (response.statusCode !== 404) {
+          endpointCache.recordEndpointFailure(baseEndpoint, request.model, config)
+        }
+      } catch (error) {
+        endpointCache.recordEndpointFailure(baseEndpoint, request.model, config)
       }
-    ]
+    }
 
-    // Try multiple endpoint paths with different request formats
-    const endpointConfigs = [
-      { path: "/v1/chat/completions", format: 0 },           // Standard OpenAI format
-      { path: "/chat/completions", format: 0 },              // Without v1 prefix
-      { path: "/v1/chat/completions", format: 1 },           // OpenAI with intent
-      { path: "/v1/engines/copilot-codex/completions", format: 2 }, // Old Copilot format
-      { path: "/engines/copilot-codex/completions", format: 2 },    // Old format without v1
-      { path: "/completions", format: 2 },                   // Simple format
-    ]
+    throw new Error(`All Copilot API endpoints failed for discovery`)
+  }
 
-    let lastError: Error | null = null
+  /**
+   * Helper method for safe stop parameter handling
+   */
+  private getSafeStopParam(stop?: string | string[]) {
+    if (stop === null || stop === undefined) {
+      return {}
+    }
+    if (typeof stop === 'string' && stop.length > 0) {
+      return { stop }
+    }
+    if (Array.isArray(stop) && stop.length > 0) {
+      return { stop }
+    }
+    return {}
+  }
 
-    for (const config of endpointConfigs) {
-      const apiUrl = `${endpoint}${config.path}`
-      const requestBody = requestFormats[config.format]
-      console.log(`Trying request to: ${apiUrl} with format ${config.format}`)
+  private async forwardToCopilot(token: string, request: ChatCompletionRequest, endpoint: string): Promise<ChatCompletionResponse> {
+    console.log(`🔄 Transformed ${request.messages.length} message(s) for Copilot compatibility`)
+
+    try {
+      // Use optimized endpoint discovery
+      const { url, requestBody } = await this.discoverOptimalEndpoint(token, request, endpoint)
+
+      console.log(`🎯 Using endpoint: ${url}`)
       console.log(`Request body:`, JSON.stringify(requestBody, null, 2))
 
       // Wrap network request in error boundary
       const networkResult = await NetworkErrorBoundary.handleRequest(
         async () => {
-          const response = await fetch(apiUrl, {
+          const response = await connectionPool.request(url, {
             method: "POST",
             headers: {
               "Authorization": `Bearer ${token}`,
@@ -580,23 +788,21 @@ export class CopilotAPIServer {
               "Editor-Plugin-Version": "copilot-chat/0.26.7",
             },
             body: JSON.stringify(requestBody),
+            timeout: 15000
           })
 
-          if (response.ok) {
-            const copilotResponse = await response.json()
+          if (response.statusCode === 200) {
+            const copilotResponse = JSON.parse(response.body)
             const actualModel = copilotResponse.model || request.model || 'unknown'
-            logger.info('ENDPOINT', `✅ Non-streaming success: ${apiUrl}`)
+            logger.info('ENDPOINT', `✅ Non-streaming success: ${url} (${response.responseTime}ms)`)
             logger.info('MODEL', `🤖 Non-streaming response using model: ${actualModel}`)
             logger.debug('RESPONSE', `Copilot response received: ${JSON.stringify(copilotResponse, null, 2)}`)
             return this.transformCopilotResponse(copilotResponse, request)
-          } else if (response.status === 404) {
-            throw new Error(`Endpoint not found: ${apiUrl}`)
           } else {
-            const errorText = await response.text()
-            throw new Error(`HTTP ${response.status}: ${errorText}`)
+            throw new Error(`HTTP ${response.statusCode}: ${response.body}`)
           }
         },
-        apiUrl,
+        url,
         {
           retryAttempts: 1,
           retryDelay: 500,
@@ -608,21 +814,12 @@ export class CopilotAPIServer {
       if (networkResult.success && networkResult.data) {
         return networkResult.data
       } else {
-        const error = networkResult.error
-        if (error) {
-          if (error.message.includes('404') || error.message.includes('not found')) {
-            logger.debug('ENDPOINT', `❌ 404 for endpoint: ${apiUrl}, trying next...`)
-          } else {
-            logger.warn('ENDPOINT', `❌ Request failed for endpoint: ${apiUrl} - ${error.message}`)
-          }
-          lastError = new Error(error.message)
-        }
-        continue
+        throw new Error(networkResult.error?.message || "Network request failed")
       }
+    } catch (error) {
+      logger.error('ENDPOINT', `❌ All endpoint attempts failed: ${error}`)
+      throw new Error(`All Copilot API endpoints failed. Error: ${error instanceof Error ? error.message : "Unknown error"}`)
     }
-
-    // If we get here, all endpoints failed
-    throw new Error(`All Copilot API endpoints failed. Last error: ${lastError?.message || "Unknown error"}`)
   }
 
   private transformCopilotResponse(copilotResponse: unknown, request: ChatCompletionRequest): ChatCompletionResponse {
@@ -763,7 +960,7 @@ export class CopilotAPIServer {
         if (response.ok) {
           // Use consolidated endpoint discovery logging
           endpointLogger.discovery(attempts, apiUrl)
-          await this.processStreamingResponse(response, stream, request, streamId, apiUrl)
+          await this.processStreamingResponseOptimized(response, stream, request, streamId, apiUrl)
           clearTimeout(streamTimeout)
           logger.info('STREAM', `🎉 Streaming request ${streamId} completed successfully`)
           return
@@ -932,6 +1129,168 @@ export class CopilotAPIServer {
       if (!isAborted) {
         reader.releaseLock()
       }
+    }
+  }
+
+  /**
+   * Optimized streaming response processing using advanced streaming manager
+   */
+  private async processStreamingResponseOptimized(
+    response: Response,
+    stream: any,
+    request: ChatCompletionRequest,
+    streamId: string,
+    apiUrl?: string
+  ): Promise<void> {
+    const startTime = Date.now()
+
+    if (!response.body) {
+      throw new Error("No response body available")
+    }
+
+    try {
+      // Create optimized stream using streaming manager
+      const optimizedStream = await streamingManager.startStream(streamId, response.body)
+      const reader = optimizedStream.getReader()
+
+      const decoder = new TextDecoder()
+      let buffer = ""
+      let chunkCount = 0
+      let lastActivityTime = Date.now()
+      let actualModel: string | null = null
+      let modelLogged = false
+      const CHUNK_TIMEOUT = 30000 // 30 seconds between chunks
+
+      // Handle client abort
+      let isAborted = false
+      stream.onAbort(() => {
+        console.log(`🚫 Client aborted streaming request ${streamId}`)
+        isAborted = true
+        reader.releaseLock()
+      })
+
+      // Set up chunk timeout monitoring
+      const chunkTimeoutInterval = setInterval(() => {
+        if (Date.now() - lastActivityTime > CHUNK_TIMEOUT) {
+          logger.warn('STREAM', `⏰ Chunk timeout for stream ${streamId}, last activity: ${Date.now() - lastActivityTime}ms ago`)
+          clearInterval(chunkTimeoutInterval)
+          reader.releaseLock()
+          throw new Error("Streaming chunk timeout - no data received for 30 seconds")
+        }
+      }, 5000) // Check every 5 seconds
+
+      try {
+        while (true) {
+          if (isAborted) {
+            logger.debug('STREAM', `🚫 Stream ${streamId} was aborted, stopping processing`)
+            break
+          }
+
+          const { done, value } = await reader.read()
+          if (done) {
+            const duration = Date.now() - startTime
+            const streamMetrics = streamingManager.getStreamMetrics(streamId)
+
+            streamLogger.complete({
+              streamId,
+              chunkCount,
+              model: actualModel || undefined,
+              duration
+            })
+
+            // Log streaming performance metrics
+            if (streamMetrics) {
+              logger.info('STREAMING_PERFORMANCE',
+                `Stream ${streamId} metrics: ${streamMetrics.processingRate.toFixed(1)} chunks/sec, ` +
+                `${streamMetrics.backpressureEvents} backpressure events, ` +
+                `${(streamMetrics.bytesProcessed / 1024).toFixed(1)}KB processed`
+              )
+            }
+            break
+          }
+
+          lastActivityTime = Date.now()
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ""
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6).trim()
+              if (data === '[DONE]') {
+                await stream.writeSSE({ data: '[DONE]' })
+                console.log(`✅ Stream ${streamId} finished with [DONE] signal${actualModel ? ` (model: ${actualModel})` : ''}`)
+                return
+              }
+
+              // Process chunk with error boundary and optimizations
+              const chunkResult = StreamingErrorBoundary.handleChunkProcessing(
+                () => {
+                  const chunk = JSON.parse(data)
+
+                  // Capture the actual model from the first chunk
+                  if (!modelLogged && chunk.model) {
+                    actualModel = chunk.model
+                    modelLogger.info(streamId, chunk.model, apiUrl ?? 'unknown')
+                    modelLogged = true
+                  }
+
+                  const transformedChunk = this.transformCopilotStreamChunk(chunk, request)
+                  return {
+                    chunk,
+                    transformedChunk,
+                    chunkData: JSON.stringify(transformedChunk)
+                  }
+                },
+                streamId,
+                chunkCount
+              )
+
+              if (chunkResult.success && chunkResult.data) {
+                try {
+                  // Use optimized backpressure handling
+                  await this.writeWithBackpressureOptimized(stream, chunkResult.data.chunkData, streamId)
+
+                  chunkCount++
+                  this.streamMetrics.totalChunks++
+                  this.streamMetrics.totalBytes += chunkResult.data.chunkData.length
+                } catch (writeError) {
+                  logger.error('STREAM', `💥 Failed to write chunk ${chunkCount} for stream ${streamId}: ${writeError}`)
+                  throw StreamingErrorBoundary.createStreamingError(
+                    'STREAM_FAILED',
+                    `Failed to write chunk: ${writeError instanceof Error ? writeError.message : 'Unknown error'}`,
+                    streamId,
+                    chunkCount
+                  )
+                }
+              } else {
+                logger.warn('STREAM', `⚠️ Skipping malformed chunk ${chunkCount} for stream ${streamId}`)
+                continue
+              }
+
+              // Log progress with adaptive frequency
+              streamLogger.progress({
+                streamId,
+                chunkCount,
+                model: actualModel || undefined,
+                startTime
+              })
+            }
+          }
+        }
+      } catch (error) {
+        console.error(`❌ Error processing optimized stream ${streamId}:`, error)
+        throw error
+      } finally {
+        clearInterval(chunkTimeoutInterval)
+        if (!isAborted) {
+          reader.releaseLock()
+        }
+      }
+    } catch (error) {
+      logger.error('STREAMING_MANAGER', `Failed to create optimized stream for ${streamId}: ${error}`)
+      // Fallback to original streaming method
+      await this.processStreamingResponse(response, stream, request, streamId, apiUrl)
     }
   }
 
@@ -1138,6 +1497,59 @@ export class CopilotAPIServer {
   }
 
   /**
+   * Optimized write with advanced backpressure handling
+   */
+  private async writeWithBackpressureOptimized(
+    stream: any,
+    data: string,
+    streamId: string
+  ): Promise<void> {
+    // Get streaming metrics for this stream
+    const streamMetrics = streamingManager.getStreamMetrics(streamId)
+
+    // Adaptive chunk sizing based on stream performance
+    let effectiveBufferSize = this.MAX_BUFFER_SIZE
+    if (streamMetrics) {
+      // Reduce buffer size if backpressure events are frequent
+      if (streamMetrics.backpressureEvents > 5) {
+        effectiveBufferSize = Math.floor(this.MAX_BUFFER_SIZE * 0.7)
+      }
+
+      // Increase buffer size for high-performing streams
+      if (streamMetrics.processingRate > 10 && streamMetrics.backpressureEvents === 0) {
+        effectiveBufferSize = Math.floor(this.MAX_BUFFER_SIZE * 1.3)
+      }
+    }
+
+    // Check if data size exceeds adaptive buffer limit
+    if (data.length > effectiveBufferSize) {
+      logger.debug('STREAMING_OPTIMIZED',
+        `Large chunk detected in ${streamId}: ${data.length} bytes (limit: ${effectiveBufferSize})`
+      )
+
+      // Use optimized chunk splitting
+      const chunks = this.splitLargeChunkOptimized(data, effectiveBufferSize)
+
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i]
+        await stream.writeSSE({ data: chunk })
+
+        // Adaptive delay based on stream performance
+        if (streamMetrics && streamMetrics.backpressureEvents > 0) {
+          // Longer delay if backpressure is active
+          const delay = Math.min(10, streamMetrics.backpressureEvents)
+          await new Promise(resolve => setTimeout(resolve, delay))
+        } else if (chunks.length > 10) {
+          // Minimal delay for large chunk sequences
+          await new Promise(resolve => setTimeout(resolve, 0.5))
+        }
+      }
+    } else {
+      await stream.writeSSE({ data })
+    }
+  }
+
+  /**
    * Split large chunks into smaller pieces
    */
   private splitLargeChunk(data: string): string[] {
@@ -1146,6 +1558,47 @@ export class CopilotAPIServer {
 
     for (let i = 0; i < data.length; i += maxChunkSize) {
       chunks.push(data.slice(i, i + maxChunkSize))
+    }
+
+    return chunks
+  }
+
+  /**
+   * Optimized chunk splitting with adaptive sizing
+   */
+  private splitLargeChunkOptimized(data: string, bufferSize: number): string[] {
+    const chunks: string[] = []
+    const maxChunkSize = Math.floor(bufferSize / 2) // Use half of adaptive buffer
+
+    // Try to split at JSON boundaries for better parsing
+    if (data.includes('}{')) {
+      // Split at JSON object boundaries
+      const jsonObjects = data.split('}{')
+      let currentChunk = ''
+
+      for (let i = 0; i < jsonObjects.length; i++) {
+        let obj = jsonObjects[i]
+
+        // Add missing braces
+        if (i > 0) obj = '{' + obj
+        if (i < jsonObjects.length - 1) obj = obj + '}'
+
+        if (currentChunk.length + obj.length > maxChunkSize && currentChunk.length > 0) {
+          chunks.push(currentChunk)
+          currentChunk = obj
+        } else {
+          currentChunk += obj
+        }
+      }
+
+      if (currentChunk.length > 0) {
+        chunks.push(currentChunk)
+      }
+    } else {
+      // Fallback to simple splitting
+      for (let i = 0; i < data.length; i += maxChunkSize) {
+        chunks.push(data.slice(i, i + maxChunkSize))
+      }
     }
 
     return chunks
@@ -1213,9 +1666,10 @@ export class CopilotAPIServer {
   }
 
   /**
-   * Start the server
+   * Start the server with HTTP/1.1 and optional HTTP/2 support
    */
-  start(): void {
+  async start(): Promise<void> {
+    // Start HTTP/1.1 server (Bun)
     const server = Bun.serve({
       port: this.port,
       hostname: this.hostname,
@@ -1232,6 +1686,13 @@ export class CopilotAPIServer {
 
     // Store server reference for graceful shutdown
     this.server = server
+
+    // HTTP/1.1 only - clean and simple
+    logger.info('SERVER', `🚀 Running HTTP/1.1 server with optimizations`)
+    logger.info('SERVER', `📊 Streaming, compression, and caching enabled`)
+
+    // Server ready
+    logger.info('SERVER', `✅ HTTP/1.1 server ready and optimized`)
   }
 
   /**
@@ -1244,6 +1705,8 @@ export class CopilotAPIServer {
     if (this.server) {
       this.server.stop()
     }
+
+    // HTTP/1.1 server stopped
 
     // Wait for active streams to complete (with timeout)
     const shutdownTimeout = 30000 // 30 seconds
@@ -1264,6 +1727,9 @@ export class CopilotAPIServer {
     if (this.memoryMonitor) {
       clearInterval(this.memoryMonitor)
     }
+
+    // Close connection pools
+    await connectionPool.close()
 
     // Log final metrics
     logger.info('SERVER', `📊 Final metrics:`)

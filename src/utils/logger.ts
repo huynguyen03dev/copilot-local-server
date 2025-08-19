@@ -106,11 +106,12 @@ export class Logger {
     }
 
     // Level with emoji
-    const levelEmojis = {
+    const levelEmojis: Record<LogLevel, string> = {
       [LogLevel.DEBUG]: '🔍',
       [LogLevel.INFO]: 'ℹ️',
       [LogLevel.WARN]: '⚠️',
-      [LogLevel.ERROR]: '❌'
+      [LogLevel.ERROR]: '❌',
+      [LogLevel.SILENT]: '🔇'
     }
     parts.push(levelEmojis[level] || 'ℹ️')
     

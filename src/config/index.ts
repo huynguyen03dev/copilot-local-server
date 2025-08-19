@@ -58,6 +58,9 @@ const PerformanceConfigSchema = z.object({
   cacheHeaders: z.boolean().default(false),
   maxMemoryUsage: z.number().min(100).default(1000), // 1GB
   gcThreshold: z.number().min(0.1).max(1.0).default(0.8), // 80%
+  enableEndpointCache: z.boolean().default(true),
+  enableTokenCache: z.boolean().default(true),
+  enableConnectionPooling: z.boolean().default(true),
 })
 
 // Main Configuration Schema
@@ -148,6 +151,9 @@ function parseEnvironmentConfig(): Config {
       cacheHeaders: parseBoolean(env.CACHE_HEADERS, false),
       maxMemoryUsage: parseInteger(env.MAX_MEMORY_MB, 1000),
       gcThreshold: parseFloat(env.GC_THRESHOLD || '0.8'),
+      enableEndpointCache: parseBoolean(env.ENABLE_ENDPOINT_CACHE, true),
+      enableTokenCache: parseBoolean(env.ENABLE_TOKEN_CACHE, true),
+      enableConnectionPooling: parseBoolean(env.ENABLE_CONNECTION_POOLING, true),
     },
     environment: (env.NODE_ENV as any) || 'development',
   }
@@ -177,6 +183,7 @@ function createConfig(): Config {
       // Development optimizations
       validatedConfig.logging.level = 'debug'
       validatedConfig.monitoring.memoryCheckInterval = Math.min(validatedConfig.monitoring.memoryCheckInterval, 15000)
+      validatedConfig.performance.enableCompression = true // Enable compression in development for testing
       validatedConfig.security.enableRateLimit = false
     }
 

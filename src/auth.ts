@@ -3,6 +3,7 @@ import fs from "fs/promises"
 import { z } from "zod"
 import { spawn } from "child_process"
 import { AuthErrorBoundary } from "./utils/errorBoundary"
+import { tokenCache, type CachedToken } from "./utils/tokenCache"
 import type {
   DeviceCodeResponse,
   AccessTokenResponse,
@@ -181,12 +182,31 @@ export class GitHubCopilotAuth {
   }
 
   /**
-   * Get valid Copilot access token and endpoint
+   * Get valid Copilot access token with caching
    */
   static async getAccessToken(): Promise<string | null> {
+    return tokenCache.getTokenWithRefresh(async () => {
+      return this.refreshTokenFromFile()
+    })
+  }
+
+  /**
+   * Refresh token from file system and API
+   */
+  private static async refreshTokenFromFile(): Promise<CachedToken | null> {
     const info = await this.getAuth()
     if (!info || info.type !== "oauth") return null
-    if (info.access && info.expires > Date.now()) return info.access
+
+    // Check if current token is still valid
+    if (info.access && info.expires > Date.now()) {
+      return {
+        token: info.access,
+        expiresAt: info.expires,
+        refreshToken: info.refresh,
+        endpoint: info.endpoint,
+        lastRefresh: Date.now()
+      }
+    }
 
     // Get new Copilot API token with error boundary
     const tokenResult = await AuthErrorBoundary.handleAuthOperation(
@@ -217,7 +237,13 @@ export class GitHubCopilotAuth {
           endpoint: tokenData.endpoints?.api, // Store the API endpoint
         })
 
-        return tokenData.token
+        return {
+          token: tokenData.token,
+          expiresAt: tokenData.expires_at * 1000,
+          refreshToken: info.refresh,
+          endpoint: tokenData.endpoints?.api,
+          lastRefresh: Date.now()
+        }
       },
       'get-access-token',
       {
@@ -524,6 +550,9 @@ export class GitHubCopilotAuth {
     } catch (error) {
       // File doesn't exist, that's fine
     }
+
+    // Clear token cache
+    tokenCache.clearCache()
   }
 
   private static async getAuth(): Promise<OAuthInfo | null> {

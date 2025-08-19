@@ -36,7 +36,8 @@
   "dependencies": {
     "hono": "^4.6.3",
     "zod": "^3.23.8",
-    "@hono/zod-validator": "^0.2.2"
+    "@hono/zod-validator": "^0.2.2",
+    "undici": "^6.19.8"
   },
   "devDependencies": {
     "@types/bun": "latest",

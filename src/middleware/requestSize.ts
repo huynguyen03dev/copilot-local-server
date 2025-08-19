@@ -57,55 +57,34 @@ export function requestSizeMiddleware(limits: Partial<RequestSizeLimits> = {}) {
         }
       }
 
-      // For JSON requests, validate the parsed content
+      // For JSON requests, validate the parsed content (optimized single-pass)
       if (c.req.header('content-type')?.includes('application/json')) {
         try {
-          // Get the raw body to check size
-          const body = await c.req.text()
-          
-          // Check raw body size
-          const bodySize = Buffer.byteLength(body, 'utf8')
-          if (bodySize > finalLimits.maxBodySize) {
-            logger.warn('REQUEST_SIZE', `Request body too large: ${bodySize} bytes (max: ${finalLimits.maxBodySize})`)
-            
-            const errorResponse = createAPIErrorResponse(
-              `Request body too large. Maximum size is ${Math.round(finalLimits.maxBodySize / 1024 / 1024)}MB`,
-              "invalid_request_error",
-              "request_too_large"
-            )
-            return c.json(errorResponse, 413)
-          }
+          // Check if streaming validation already processed this request
+          const streamingValidatedBody = c.get('streamingValidatedBody')
 
-          // Parse and validate JSON structure
-          let parsedBody: any
-          try {
-            parsedBody = JSON.parse(body)
-          } catch (parseError) {
-            logger.warn('REQUEST_SIZE', `Invalid JSON in request body: ${parseError}`)
-            
-            const errorResponse = createAPIErrorResponse(
-              "Invalid JSON in request body",
-              "invalid_request_error",
-              "invalid_json"
-            )
-            return c.json(errorResponse, 400)
-          }
+          if (streamingValidatedBody) {
+            // Use already validated body from streaming validation
+            logger.debug('REQUEST_SIZE', 'Using pre-validated body from streaming validation')
+            c.set('parsedBody', streamingValidatedBody)
+          } else {
+            // Perform single-pass validation and parsing
+            const validationResult = await validateAndParseJsonSinglePass(c, finalLimits)
 
-          // Validate JSON structure limits
-          const validation = validateJsonStructure(parsedBody, finalLimits)
-          if (!validation.valid) {
-            logger.warn('REQUEST_SIZE', `JSON structure validation failed: ${validation.error}`)
-            
-            const errorResponse = createAPIErrorResponse(
-              validation.error,
-              "invalid_request_error",
-              "invalid_structure"
-            )
-            return c.json(errorResponse, 400)
-          }
+            if (!validationResult.success) {
+              return c.json(validationResult.errorResponse, validationResult.statusCode)
+            }
 
-          // Store the parsed body for later use
-          c.set('parsedBody', parsedBody)
+            // Store the parsed body for later use
+            c.set('parsedBody', validationResult.parsedBody)
+
+            // Store validation metadata
+            c.set('requestValidationMetadata', {
+              bodySize: validationResult.bodySize,
+              parseTime: validationResult.parseTime,
+              validationTime: validationResult.validationTime
+            })
+          }
           
         } catch (error) {
           logger.error('REQUEST_SIZE', `Error validating request size: ${error}`)
@@ -129,6 +108,118 @@ export function requestSizeMiddleware(limits: Partial<RequestSizeLimits> = {}) {
         "middleware_error"
       )
       return c.json(errorResponse, 500)
+    }
+  }
+
+/**
+ * Single-pass JSON validation and parsing for optimal performance
+ */
+async function validateAndParseJsonSinglePass(
+    c: Context,
+    limits: RequestSizeLimits
+  ): Promise<{
+    success: boolean
+    parsedBody?: any
+    bodySize?: number
+    parseTime?: number
+    validationTime?: number
+    errorResponse?: any
+    statusCode?: number
+  }> {
+    const startTime = Date.now()
+
+    try {
+      // Get the raw body to check size
+      const body = await c.req.text()
+      const parseTime = Date.now() - startTime
+
+      // Check raw body size
+      const bodySize = Buffer.byteLength(body, 'utf8')
+      if (bodySize > limits.maxBodySize) {
+        logger.warn('REQUEST_SIZE', `Request body too large: ${bodySize} bytes (max: ${limits.maxBodySize})`)
+
+        return {
+          success: false,
+          errorResponse: createAPIErrorResponse(
+            `Request body too large. Maximum size is ${Math.round(limits.maxBodySize / 1024 / 1024)}MB`,
+            "invalid_request_error",
+            "request_too_large"
+          ),
+          statusCode: 413
+        }
+      }
+
+      // Parse JSON with error handling
+      let parsedBody: any
+      const jsonParseStart = Date.now()
+
+      try {
+        parsedBody = JSON.parse(body)
+      } catch (parseError) {
+        logger.warn('REQUEST_SIZE', `Invalid JSON in request body: ${parseError}`)
+
+        return {
+          success: false,
+          errorResponse: createAPIErrorResponse(
+            "Invalid JSON in request body",
+            "invalid_request_error",
+            "invalid_json"
+          ),
+          statusCode: 400
+        }
+      }
+
+      const jsonParseTime = Date.now() - jsonParseStart
+
+      // Validate JSON structure limits (optimized)
+      const validationStart = Date.now()
+      const validation = validateJsonStructureOptimized(parsedBody, limits)
+      const validationTime = Date.now() - validationStart
+
+      if (!validation.valid) {
+        logger.warn('REQUEST_SIZE', `JSON structure validation failed: ${validation.error}`)
+
+        return {
+          success: false,
+          errorResponse: createAPIErrorResponse(
+            validation.error || "Invalid JSON structure",
+            "invalid_request_error",
+            "invalid_structure"
+          ),
+          statusCode: 400
+        }
+      }
+
+      const totalTime = Date.now() - startTime
+
+      // Log performance metrics for large requests
+      if (bodySize > 10000 || totalTime > 10) {
+        logger.debug('REQUEST_SIZE',
+          `Single-pass validation completed: ${bodySize} bytes in ${totalTime}ms ` +
+          `(parse: ${parseTime + jsonParseTime}ms, validate: ${validationTime}ms)`
+        )
+      }
+
+      return {
+        success: true,
+        parsedBody,
+        bodySize,
+        parseTime: parseTime + jsonParseTime,
+        validationTime
+      }
+
+    } catch (error) {
+      logger.error('REQUEST_SIZE', `Single-pass validation error: ${error}`)
+
+      return {
+        success: false,
+        errorResponse: createAPIErrorResponse(
+          "Failed to validate request",
+          "internal_error",
+          "validation_failed"
+        ),
+        statusCode: 500
+      }
     }
   }
 }
@@ -173,6 +264,102 @@ function validateJsonStructure(obj: any, limits: RequestSizeLimits, depth = 0): 
   }
 
   return { valid: true }
+}
+
+/**
+ * Optimized JSON structure validation with early termination and performance tracking
+ */
+function validateJsonStructureOptimized(obj: any, limits: RequestSizeLimits): {
+  valid: boolean
+  error?: string
+  stats?: {
+    nodesVisited: number
+    maxDepthReached: number
+    largestArrayFound: number
+    longestStringFound: number
+  }
+} {
+  let nodesVisited = 0
+  let maxDepthReached = 0
+  let largestArrayFound = 0
+  let longestStringFound = 0
+
+  function validateRecursive(value: any, depth: number): { valid: boolean; error?: string } {
+    nodesVisited++
+    maxDepthReached = Math.max(maxDepthReached, depth)
+
+    // Early termination for performance
+    if (nodesVisited > 10000) { // Prevent excessive processing
+      return {
+        valid: false,
+        error: "JSON structure too complex (too many nodes)"
+      }
+    }
+
+    // Check depth limit
+    if (depth > limits.maxJsonDepth) {
+      return {
+        valid: false,
+        error: `JSON nesting too deep: ${depth} levels (max: ${limits.maxJsonDepth})`
+      }
+    }
+
+    // Check arrays (optimized)
+    if (Array.isArray(value)) {
+      largestArrayFound = Math.max(largestArrayFound, value.length)
+
+      if (value.length > limits.maxArrayLength) {
+        return {
+          valid: false,
+          error: `Array too long: ${value.length} elements (max: ${limits.maxArrayLength})`
+        }
+      }
+
+      // Validate array elements with early termination
+      for (let i = 0; i < value.length; i++) {
+        const result = validateRecursive(value[i], depth + 1)
+        if (!result.valid) {
+          return result
+        }
+      }
+    }
+    // Check objects (optimized)
+    else if (value && typeof value === 'object') {
+      // Use Object.values for better performance than for...in
+      const values = Object.values(value)
+      for (let i = 0; i < values.length; i++) {
+        const result = validateRecursive(values[i], depth + 1)
+        if (!result.valid) {
+          return result
+        }
+      }
+    }
+    // Check strings (optimized)
+    else if (typeof value === 'string') {
+      longestStringFound = Math.max(longestStringFound, value.length)
+
+      if (value.length > limits.maxStringLength) {
+        return {
+          valid: false,
+          error: `String too long: ${value.length} characters (max: ${limits.maxStringLength})`
+        }
+      }
+    }
+
+    return { valid: true }
+  }
+
+  const result = validateRecursive(obj, 0)
+
+  return {
+    ...result,
+    stats: {
+      nodesVisited,
+      maxDepthReached,
+      largestArrayFound,
+      longestStringFound
+    }
+  }
 }
 
 /**
