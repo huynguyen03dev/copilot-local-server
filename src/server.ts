@@ -90,6 +90,7 @@ export class CopilotAPIServer {
   private activeStreams = new Set<string>()
   private streamingRateLimit = new Map<string, number>()
   private streamStartTimes = new Map<string, number>()  // Track stream start times for cleanup sweeper
+  private streamTimeouts = new Map<string, NodeJS.Timeout>()  // Track stream timeout handles
   private readonly MAX_CONCURRENT_STREAMS = config.server.maxConcurrentStreams
   private readonly RATE_LIMIT_INTERVAL = config.streaming.rateLimitInterval
   private readonly IS_TEST_ENVIRONMENT = process.env.NODE_ENV === 'test'
@@ -114,9 +115,6 @@ export class CopilotAPIServer {
 
   // Server instance for graceful shutdown
   private server: any = null
-
-  // Environment detection
-  private readonly IS_TEST_ENVIRONMENT = process.env.NODE_ENV === 'test'
 
   constructor(
     port: number = config.server.port,
@@ -616,7 +614,7 @@ export class CopilotAPIServer {
               } finally {
                 // GUARANTEED CLEANUP: Always untrack stream, even on unexpected errors
                 // This prevents memory leaks in activeStreams and streamStartTimes maps
-                this.untrackStream(streamId)
+                await this.cleanupStreamGuaranteed(streamId, 'finally block')
               }
             })
           } else {
@@ -1128,7 +1126,7 @@ export class CopilotAPIServer {
 
           // Use consolidated endpoint discovery logging
           endpointLogger.discovery(attempts, apiUrl)
-          await this.processStreamingResponseOptimized(response, stream, request, streamId, apiUrl)
+          await this.processStreamingResponseUnified(response, stream, request, streamId, apiUrl, true)
           clearTimeout(streamTimeout)
           logger.info('STREAM', `🎉 Streaming request ${streamId} completed successfully`)
           return
@@ -1162,6 +1160,212 @@ export class CopilotAPIServer {
     }
   }
 
+  /**
+   * PERFORMANCE OPTIMIZATION: Unified streaming response processing
+   * Consolidates both streaming implementations with configurable optimizations
+   */
+  private async processStreamingResponseUnified(
+    response: Response,
+    stream: any,
+    request: ChatCompletionRequest,
+    streamId: string,
+    apiUrl?: string,
+    useOptimizations: boolean = true
+  ): Promise<void> {
+    const startTime = Date.now()
+
+    if (!response.body) {
+      throw new Error("No response body available")
+    }
+
+    // PERFORMANCE OPTIMIZATION: Use Transform streams for efficient processing
+    let reader: ReadableStreamDefaultReader<Uint8Array>
+
+    if (useOptimizations) {
+      try {
+        // Try to use optimized streaming manager
+        const optimizedStream = await streamingManager.startStream(streamId, response.body)
+        reader = optimizedStream.getReader()
+      } catch (error) {
+        logger.warn('STREAMING_UNIFIED', `Failed to create optimized stream for ${streamId}, falling back to basic: ${error}`)
+        reader = response.body.getReader()
+      }
+    } else {
+      reader = response.body.getReader()
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = Buffer.alloc(0) // PERFORMANCE OPTIMIZATION: Use Buffer instead of string
+    let chunkCount = 0
+    let lastActivityTime = Date.now()
+    let actualModel: string | null = null
+    let modelLogged = false
+    const CHUNK_TIMEOUT = 30000 // 30 seconds between chunks
+
+    // Handle client abort with guaranteed cleanup
+    let isAborted = false
+    stream.onAbort(() => {
+      console.log(`🚫 Client aborted streaming request ${streamId}`)
+      isAborted = true
+      reader.releaseLock()
+      this.cleanupStreamGuaranteed(streamId, 'client abort (unified)')
+    })
+
+    // Set up chunk timeout monitoring
+    const chunkTimeoutInterval = setInterval(() => {
+      if (Date.now() - lastActivityTime > CHUNK_TIMEOUT) {
+        logger.warn('STREAM', `⏰ Chunk timeout for stream ${streamId}, last activity: ${Date.now() - lastActivityTime}ms ago`)
+        clearInterval(chunkTimeoutInterval)
+        reader.releaseLock()
+        throw new Error("Streaming chunk timeout - no data received for 30 seconds")
+      }
+    }, 5000) // Check every 5 seconds
+
+    try {
+      while (true) {
+        if (isAborted) {
+          logger.debug('STREAM', `🚫 Stream ${streamId} was aborted, stopping processing`)
+          break
+        }
+
+        const { done, value } = await reader.read()
+        if (done) {
+          const duration = Date.now() - startTime
+
+          // Log completion with metrics
+          streamLogger.complete({
+            streamId,
+            chunkCount,
+            model: actualModel || undefined,
+            duration
+          })
+
+          // Log streaming performance metrics if optimizations were used
+          if (useOptimizations) {
+            const streamMetrics = streamingManager.getStreamMetrics(streamId)
+            if (streamMetrics) {
+              logger.info('STREAMING_PERFORMANCE',
+                `Stream ${streamId} metrics: ${streamMetrics.processingRate.toFixed(1)} chunks/sec, ` +
+                `${streamMetrics.backpressureEvents} backpressure events, ` +
+                `${(streamMetrics.bytesProcessed / 1024).toFixed(1)}KB processed`
+              )
+            }
+          }
+          break
+        }
+
+        // PERFORMANCE OPTIMIZATION: Efficient buffer management
+        buffer = Buffer.concat([buffer, Buffer.from(value)])
+        lastActivityTime = Date.now()
+
+        // Process complete lines from buffer
+        const { completeLines, remainingBuffer } = this.extractCompleteLines(buffer)
+        buffer = remainingBuffer
+
+        for (const line of completeLines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6).trim()
+            if (data === '[DONE]') {
+              await stream.writeSSE({ data: '[DONE]' })
+              console.log(`✅ Stream ${streamId} finished with [DONE] signal${actualModel ? ` (model: ${actualModel})` : ''}`)
+              return
+            }
+
+            // Process chunk with error boundary
+            const chunkResult = StreamingErrorBoundary.handleChunkProcessing(
+              () => {
+                const chunk = JSON.parse(data)
+
+                // Capture the actual model from the first chunk
+                if (!modelLogged && chunk.model) {
+                  actualModel = chunk.model
+                  modelLogger.info(streamId, chunk.model, apiUrl ?? 'unknown')
+                  modelLogged = true
+                }
+
+                const transformedChunk = this.transformCopilotStreamChunk(chunk, request)
+                return {
+                  chunk,
+                  transformedChunk,
+                  chunkData: JSON.stringify(transformedChunk)
+                }
+              },
+              streamId,
+              chunkCount
+            )
+
+            if (chunkResult.success && chunkResult.data) {
+              try {
+                // Use appropriate backpressure handling based on optimization level
+                if (useOptimizations) {
+                  await this.writeWithBackpressureOptimized(stream, chunkResult.data.chunkData, streamId)
+                } else {
+                  await this.writeWithBackpressure(stream, chunkResult.data.chunkData, streamId)
+                }
+
+                chunkCount++
+                this.streamMetrics.totalChunks++
+                this.streamMetrics.totalBytes += chunkResult.data.chunkData.length
+              } catch (writeError) {
+                logger.error('STREAM', `💥 Failed to write chunk ${chunkCount} for stream ${streamId}: ${writeError}`)
+                throw StreamingErrorBoundary.createStreamingError(
+                  'STREAM_FAILED',
+                  `Failed to write chunk: ${writeError instanceof Error ? writeError.message : 'Unknown error'}`,
+                  streamId,
+                  chunkCount
+                )
+              }
+            } else {
+              logger.warn('STREAM', `⚠️ Skipping malformed chunk ${chunkCount} for stream ${streamId}`)
+              continue
+            }
+
+            // PERFORMANCE OPTIMIZATION: Throttle progress logging
+            const logFrequency = useOptimizations ? 10 : 5
+            if (chunkCount % logFrequency === 0) {
+              streamLogger.progress({
+                streamId,
+                chunkCount,
+                model: actualModel || undefined,
+                startTime
+              })
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error(`❌ Error processing unified stream ${streamId}:`, error)
+      throw error
+    } finally {
+      clearInterval(chunkTimeoutInterval)
+      if (!isAborted) {
+        reader.releaseLock()
+      }
+    }
+  }
+
+  /**
+   * PERFORMANCE OPTIMIZATION: Extract complete lines from buffer efficiently
+   * Processes buffer data to find complete lines ending with \n
+   */
+  private extractCompleteLines(buffer: Buffer): { completeLines: string[]; remainingBuffer: Buffer } {
+    const decoder = new TextDecoder()
+    const text = decoder.decode(buffer)
+    const lines = text.split('\n')
+
+    // Last element might be incomplete if buffer doesn't end with \n
+    const remainingText = lines.pop() || ''
+    const remainingBuffer = Buffer.from(remainingText)
+
+    return {
+      completeLines: lines,
+      remainingBuffer
+    }
+  }
+
+  /**
+   * @deprecated Use processStreamingResponseUnified instead
+   */
   private async processStreamingResponse(
     response: Response,
     stream: any,
@@ -1192,7 +1396,7 @@ export class CopilotAPIServer {
 
       // PERFORMANCE OPTIMIZATION: Ensure stream cleanup on client abort
       // This prevents memory leaks when clients disconnect unexpectedly
-      this.untrackStream(streamId)
+      this.cleanupStreamGuaranteed(streamId, 'client abort')
     })
 
     // Set up chunk timeout monitoring
@@ -1361,7 +1565,7 @@ export class CopilotAPIServer {
 
         // PERFORMANCE OPTIMIZATION: Ensure stream cleanup on client abort (optimized path)
         // This prevents memory leaks when clients disconnect unexpectedly
-        this.untrackStream(streamId)
+        this.cleanupStreamGuaranteed(streamId, 'client abort (optimized)')
       })
 
       // Set up chunk timeout monitoring
@@ -1503,8 +1707,8 @@ export class CopilotAPIServer {
       }
     } catch (error) {
       logger.error('STREAMING_MANAGER', `Failed to create optimized stream for ${streamId}: ${error}`)
-      // Fallback to original streaming method
-      await this.processStreamingResponse(response, stream, request, streamId, apiUrl)
+      // Fallback to unified streaming method without optimizations
+      await this.processStreamingResponseUnified(response, stream, request, streamId, apiUrl, false)
     }
   }
 
@@ -1682,6 +1886,14 @@ export class CopilotAPIServer {
     this.activeStreams.add(streamId)
     this.streamStartTimes.set(streamId, Date.now())  // Track start time for cleanup sweeper
     this.streamMetrics.totalRequests++
+
+    // Set up automatic cleanup timeout as safety net
+    const timeoutId = setTimeout(() => {
+      logger.warn('STREAM_TIMEOUT', `Stream ${streamId} timed out after ${this.STREAM_TIMEOUT_MS}ms`)
+      this.cleanupStreamGuaranteed(streamId, 'timeout')
+    }, this.STREAM_TIMEOUT_MS)
+
+    this.streamTimeouts.set(streamId, timeoutId)
     streamLogger.start(streamId, this.activeStreams.size, this.MAX_CONCURRENT_STREAMS)
   }
 
@@ -1690,9 +1902,41 @@ export class CopilotAPIServer {
    * PERFORMANCE OPTIMIZATION: Clean up both tracking maps to prevent memory leaks
    */
   private untrackStream(streamId: string): void {
-    this.activeStreams.delete(streamId)
-    this.streamStartTimes.delete(streamId)  // Clean up start time tracking
-    streamLogger.end(streamId, this.activeStreams.size, this.MAX_CONCURRENT_STREAMS)
+    this.cleanupStreamGuaranteed(streamId, 'normal completion')
+  }
+
+  /**
+   * PERFORMANCE OPTIMIZATION: Guaranteed stream cleanup with comprehensive error handling
+   * Ensures all stream-related resources are cleaned up to prevent memory leaks
+   */
+  private async cleanupStreamGuaranteed(streamId: string, reason: string): Promise<void> {
+    try {
+      // Always cleanup both tracking maps
+      this.activeStreams.delete(streamId)
+      this.streamStartTimes.delete(streamId)
+
+      // Clear any associated timeout timers
+      const timeoutId = this.streamTimeouts.get(streamId)
+      if (timeoutId) {
+        clearTimeout(timeoutId)
+        this.streamTimeouts.delete(streamId)
+      }
+
+      // Update stream metrics
+      this.streamMetrics.totalRequests = Math.max(0, this.streamMetrics.totalRequests)
+
+      // Log cleanup with reason
+      streamLogger.end(streamId, this.activeStreams.size, this.MAX_CONCURRENT_STREAMS)
+      logger.debug('STREAM_CLEANUP', `Stream ${streamId} cleaned up: ${reason}`)
+
+    } catch (error) {
+      // Even if cleanup fails, ensure critical maps are cleared
+      this.activeStreams.delete(streamId)
+      this.streamStartTimes.delete(streamId)
+      this.streamTimeouts.delete(streamId)
+
+      logger.error('STREAM_CLEANUP', `Failed to cleanup stream ${streamId}: ${error}`)
+    }
   }
 
   /**
@@ -1844,42 +2088,65 @@ export class CopilotAPIServer {
   }
 
   /**
-   * Sweep stuck streams that have been active too long
-   * PERFORMANCE OPTIMIZATION: Prevents memory leaks from abandoned streams
+   * PERFORMANCE OPTIMIZATION: Enhanced stuck stream sweeper with orphaned entry detection
+   * Prevents memory leaks from abandoned streams and inconsistent state
    */
-  private sweepStuckStreams(): void {
+  private sweepStuckStreamsEnhanced(): void {
     const now = Date.now()
     const stuckStreams: string[] = []
+    const orphanedEntries: string[] = []
 
-    // Find streams that have been active longer than the timeout
+    // Find streams that have been active too long
     for (const [streamId, startTime] of this.streamStartTimes.entries()) {
       if (now - startTime > this.STREAM_TIMEOUT_MS) {
         stuckStreams.push(streamId)
       }
+
+      // Also check for orphaned entries (in streamStartTimes but not activeStreams)
+      if (!this.activeStreams.has(streamId)) {
+        orphanedEntries.push(streamId)
+      }
     }
 
-    // Clean up stuck streams
-    if (stuckStreams.length > 0) {
+    // Find orphaned active streams (in activeStreams but not streamStartTimes)
+    const orphanedActiveStreams: string[] = []
+    for (const streamId of this.activeStreams) {
+      if (!this.streamStartTimes.has(streamId)) {
+        orphanedActiveStreams.push(streamId)
+      }
+    }
+
+    // Cleanup all problematic streams
+    const allProblematicStreams = [...stuckStreams, ...orphanedEntries, ...orphanedActiveStreams]
+
+    if (allProblematicStreams.length > 0) {
       logger.warn('STREAM_CLEANUP',
-        `🧹 Cleaning up ${stuckStreams.length} stuck stream(s) that exceeded ${this.STREAM_TIMEOUT_MS / 1000}s timeout`
+        `🧹 Cleaning up ${stuckStreams.length} stuck, ${orphanedEntries.length} orphaned entries, ` +
+        `${orphanedActiveStreams.length} orphaned active streams`
       )
 
-      for (const streamId of stuckStreams) {
-        // Force cleanup of stuck stream
-        this.activeStreams.delete(streamId)
-        this.streamStartTimes.delete(streamId)
+      for (const streamId of allProblematicStreams) {
+        // Use guaranteed cleanup for all problematic streams
+        this.cleanupStreamGuaranteed(streamId, 'sweeper cleanup')
 
         // Update metrics to reflect the cleanup
         this.streamMetrics.failedStreams++
-
-        logger.debug('STREAM_CLEANUP', `🧹 Cleaned up stuck stream: ${streamId}`)
       }
 
       // Log cleanup summary for monitoring
       logger.info('STREAM_CLEANUP',
-        `✅ Stream cleanup complete. Active streams: ${this.activeStreams.size}/${this.MAX_CONCURRENT_STREAMS}`
+        `✅ Enhanced stream cleanup complete. Active streams: ${this.activeStreams.size}/${this.MAX_CONCURRENT_STREAMS}, ` +
+        `Start times tracked: ${this.streamStartTimes.size}, Timeouts tracked: ${this.streamTimeouts.size}`
       )
     }
+  }
+
+  /**
+   * Legacy method for backward compatibility
+   * @deprecated Use sweepStuckStreamsEnhanced instead
+   */
+  private sweepStuckStreams(): void {
+    this.sweepStuckStreamsEnhanced()
   }
 
   /**

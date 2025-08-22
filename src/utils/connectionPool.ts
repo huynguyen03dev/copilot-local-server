@@ -46,6 +46,18 @@ export class ConnectionPoolManager {
   private waitQueues = new Map<string, Array<{ resolve: () => void, timestamp: number }>>()
   private queueStats = new Map<string, { totalWaits: number, totalWaitTime: number }>()
 
+  // PERFORMANCE OPTIMIZATION: Periodic statistics updates
+  private statsUpdateInterval: NodeJS.Timeout | null = null
+  private readonly STATS_UPDATE_INTERVAL_MS = 5000 // Update every 5 seconds
+
+  // PERFORMANCE OPTIMIZATION: Cached moving averages to reduce per-request calculations
+  private cachedAverages = new Map<string, {
+    averageResponseTime: number
+    averageQueueTime: number
+    connectionUtilization: number
+    lastUpdated: number
+  }>()
+
   constructor(config?: Partial<ConnectionPoolConfig>) {
     this.config = {
       maxConnections: 10,
@@ -65,6 +77,9 @@ export class ConnectionPoolManager {
     }
 
     logger.info('CONNECTION_POOL', `Initialized with ${this.config.maxConnections} max connections per origin`)
+
+    // PERFORMANCE OPTIMIZATION: Start periodic statistics updates
+    this.startPeriodicStatsUpdate()
   }
 
   /**
@@ -133,19 +148,65 @@ export class ConnectionPoolManager {
   }
 
   /**
-   * PERFORMANCE OPTIMIZATION: Update derived stats for origin
-   * Calculates queue metrics and connection utilization
+   * PERFORMANCE OPTIMIZATION: Start periodic statistics updates
+   * Updates derived statistics every few seconds instead of on every request
    */
-  private updateDerivedStats(origin: string): void {
+  private startPeriodicStatsUpdate(): void {
+    this.statsUpdateInterval = setInterval(() => {
+      this.updateAllDerivedStats()
+    }, this.STATS_UPDATE_INTERVAL_MS)
+
+    logger.debug('CONNECTION_POOL', `Started periodic stats updates every ${this.STATS_UPDATE_INTERVAL_MS}ms`)
+  }
+
+  /**
+   * PERFORMANCE OPTIMIZATION: Update all derived stats periodically
+   * Batch updates all statistics to reduce per-request overhead
+   */
+  private updateAllDerivedStats(): void {
+    for (const [origin] of this.stats) {
+      this.updateDerivedStatsForOrigin(origin)
+    }
+  }
+
+  /**
+   * PERFORMANCE OPTIMIZATION: Update derived stats for origin (optimized version)
+   * Calculates queue metrics and connection utilization with caching
+   */
+  private updateDerivedStatsForOrigin(origin: string): void {
     const stats = this.stats.get(origin)
     if (!stats) return
 
     const queue = this.waitQueues.get(origin) || []
     const queueStat = this.queueStats.get(origin) || { totalWaits: 0, totalWaitTime: 0 }
 
+    // Update real-time stats
     stats.queuedRequests = queue.length
     stats.averageQueueTime = queueStat.totalWaits > 0 ? queueStat.totalWaitTime / queueStat.totalWaits : 0
     stats.connectionUtilization = stats.activeConnections / this.config.maxConnections
+
+    // Cache the calculated values
+    this.cachedAverages.set(origin, {
+      averageResponseTime: stats.averageResponseTime,
+      averageQueueTime: stats.averageQueueTime,
+      connectionUtilization: stats.connectionUtilization,
+      lastUpdated: Date.now()
+    })
+  }
+
+  /**
+   * PERFORMANCE OPTIMIZATION: Update derived stats for origin (lightweight version)
+   * Only updates critical stats during request processing
+   */
+  private updateDerivedStats(origin: string): void {
+    const stats = this.stats.get(origin)
+    if (!stats) return
+
+    // Only update queue length during request processing (lightweight)
+    const queue = this.waitQueues.get(origin) || []
+    stats.queuedRequests = queue.length
+
+    // Other stats are updated periodically to reduce overhead
   }
 
   /**
@@ -299,8 +360,10 @@ export class ConnectionPoolManager {
 
       // Update stats
       stats.pendingRequests--
-      stats.averageResponseTime = this.calculateMovingAverage(
-        stats.averageResponseTime,
+
+      // PERFORMANCE OPTIMIZATION: Use optimized moving average calculation
+      stats.averageResponseTime = this.calculateMovingAverageOptimized(
+        origin,
         responseTime,
         stats.totalRequests
       )
@@ -373,8 +436,10 @@ export class ConnectionPoolManager {
 
       // Update stats
       stats.pendingRequests--
-      stats.averageResponseTime = this.calculateMovingAverage(
-        stats.averageResponseTime,
+
+      // PERFORMANCE OPTIMIZATION: Use optimized moving average calculation
+      stats.averageResponseTime = this.calculateMovingAverageOptimized(
+        origin,
         responseTime,
         stats.totalRequests
       )
@@ -482,7 +547,13 @@ export class ConnectionPoolManager {
    */
   async close(): Promise<void> {
     logger.info('CONNECTION_POOL', 'Closing all connection pools...')
-    
+
+    // PERFORMANCE OPTIMIZATION: Stop periodic stats updates
+    if (this.statsUpdateInterval) {
+      clearInterval(this.statsUpdateInterval)
+      this.statsUpdateInterval = null
+    }
+
     const closePromises = Array.from(this.pools.values()).map(pool => pool.close())
     await Promise.all(closePromises)
 
@@ -491,7 +562,8 @@ export class ConnectionPoolManager {
     this.inFlightCount.clear()
     this.waitQueues.clear()
     this.queueStats.clear()
-    
+    this.cachedAverages.clear()
+
     logger.info('CONNECTION_POOL', 'All connection pools closed')
   }
 
@@ -515,6 +587,30 @@ export class ConnectionPoolManager {
     }
     
     logger.info('CONNECTION_POOL', `Statistics cleared for ${origin || 'all origins'}`)
+  }
+
+  /**
+   * PERFORMANCE OPTIMIZATION: Optimized moving average calculation with caching
+   * Reduces calculation overhead by using cached values when possible
+   */
+  private calculateMovingAverageOptimized(origin: string, newValue: number, count: number): number {
+    if (count <= 1) return newValue
+
+    // Use cached value if available and recent
+    const cached = this.cachedAverages.get(origin)
+    const now = Date.now()
+
+    if (cached && (now - cached.lastUpdated) < this.STATS_UPDATE_INTERVAL_MS) {
+      // Use cached average for calculation
+      return (cached.averageResponseTime * (count - 1) + newValue) / count
+    }
+
+    // Fallback to traditional calculation
+    return this.calculateMovingAverage(
+      this.stats.get(origin)?.averageResponseTime || 0,
+      newValue,
+      count
+    )
   }
 
   private calculateMovingAverage(current: number, newValue: number, count: number): number {

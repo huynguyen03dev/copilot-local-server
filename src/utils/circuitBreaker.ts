@@ -43,7 +43,65 @@ export interface CircuitBreakerEvent {
 }
 
 /**
- * Circuit Breaker implementation with advanced monitoring
+ * PERFORMANCE OPTIMIZATION: Circular buffer for bounded memory usage
+ * Prevents unbounded array growth in high-traffic scenarios
+ */
+class CircularBuffer<T> {
+  private buffer: T[]
+  private head = 0
+  private tail = 0
+  private size = 0
+
+  constructor(private capacity: number) {
+    this.buffer = new Array(capacity)
+  }
+
+  add(item: T): void {
+    this.buffer[this.tail] = item
+    this.tail = (this.tail + 1) % this.capacity
+
+    if (this.size < this.capacity) {
+      this.size++
+    } else {
+      // Buffer is full, move head forward
+      this.head = (this.head + 1) % this.capacity
+    }
+  }
+
+  filter(predicate: (item: T) => boolean): T[] {
+    const result: T[] = []
+    for (let i = 0; i < this.size; i++) {
+      const index = (this.head + i) % this.capacity
+      const item = this.buffer[index]
+      if (predicate(item)) {
+        result.push(item)
+      }
+    }
+    return result
+  }
+
+  getAll(): T[] {
+    const result: T[] = []
+    for (let i = 0; i < this.size; i++) {
+      const index = (this.head + i) % this.capacity
+      result.push(this.buffer[index])
+    }
+    return result
+  }
+
+  get length(): number {
+    return this.size
+  }
+
+  clear(): void {
+    this.head = 0
+    this.tail = 0
+    this.size = 0
+  }
+}
+
+/**
+ * Circuit Breaker implementation with advanced monitoring and performance optimizations
  */
 export class CircuitBreaker {
   private state: CircuitBreakerState = 'CLOSED'
@@ -54,10 +112,28 @@ export class CircuitBreaker {
   private lastSuccessTime = 0
   private stateChangeTime = Date.now()
   private stateChanges = 0
-  private recentRequests: Array<{ timestamp: number; success: boolean; duration: number }> = []
+
+  // PERFORMANCE OPTIMIZATION: Use circular buffer instead of unbounded array
+  private recentRequests: CircularBuffer<{ timestamp: number; success: boolean; duration: number }>
+
+  // PERFORMANCE OPTIMIZATION: Cache failure rate calculations
+  private cachedMetrics: {
+    failureRate: number
+    averageResponseTime: number
+    lastCalculated: number
+  } | null = null
+
   private eventListeners: Array<(event: CircuitBreakerEvent) => void> = []
 
+  // Cache invalidation threshold (1 second)
+  private static readonly CACHE_TTL_MS = 1000
+
+  // Maximum requests to track (prevents unbounded growth)
+  private static readonly MAX_RECENT_REQUESTS = 100
+
   constructor(private config: CircuitBreakerConfig) {
+    // PERFORMANCE OPTIMIZATION: Initialize circular buffer with bounded capacity
+    this.recentRequests = new CircularBuffer(CircuitBreaker.MAX_RECENT_REQUESTS)
     this.logStateChange('CLOSED', 'CLOSED', 'Circuit breaker initialized')
   }
 
@@ -191,35 +267,28 @@ export class CircuitBreaker {
   }
 
   /**
-   * Add request to recent requests tracking
+   * PERFORMANCE OPTIMIZATION: Add request to recent requests tracking using circular buffer
+   * No need for filtering - circular buffer automatically manages capacity
    */
   private addToRecentRequests(success: boolean, duration: number): void {
     const now = Date.now()
-    this.recentRequests.push({ timestamp: now, success, duration })
+    this.recentRequests.add({ timestamp: now, success, duration })
 
-    // Clean old requests outside monitoring window
-    const cutoff = now - this.config.monitoringWindow
-    this.recentRequests = this.recentRequests.filter(req => req.timestamp > cutoff)
+    // Invalidate cached metrics when new data is added
+    this.cachedMetrics = null
   }
 
   /**
-   * Check if circuit should open
+   * PERFORMANCE OPTIMIZATION: Check if circuit should open using cached calculations
    */
   private shouldOpen(): boolean {
     if (this.failureCount < this.config.failureThreshold) {
       return false
     }
 
-    // Calculate failure rate within monitoring window
-    const recentFailures = this.recentRequests.filter(req => !req.success).length
-    const recentTotal = this.recentRequests.length
-
-    if (recentTotal === 0) {
-      return false
-    }
-
-    const failureRate = recentFailures / recentTotal
-    return failureRate >= 0.5 // 50% failure rate threshold
+    // Use cached failure rate calculation
+    const metrics = this.getCachedMetrics()
+    return metrics.failureRate >= 0.5 // 50% failure rate threshold
   }
 
   /**
@@ -240,6 +309,9 @@ export class CircuitBreaker {
     this.stateChangeTime = Date.now()
     this.stateChanges++
 
+    // PERFORMANCE OPTIMIZATION: Invalidate cache on state change
+    this.cachedMetrics = null
+
     this.logStateChange(previousState, 'CLOSED', 'Circuit breaker closed - service recovered')
   }
 
@@ -252,7 +324,10 @@ export class CircuitBreaker {
     this.stateChangeTime = Date.now()
     this.stateChanges++
 
-    this.logStateChange(previousState, 'OPEN', 
+    // PERFORMANCE OPTIMIZATION: Invalidate cache on state change
+    this.cachedMetrics = null
+
+    this.logStateChange(previousState, 'OPEN',
       `Circuit breaker opened - failure threshold exceeded (${this.failureCount}/${this.config.failureThreshold})`
     )
   }
@@ -266,6 +341,9 @@ export class CircuitBreaker {
     this.successCount = 0
     this.stateChangeTime = Date.now()
     this.stateChanges++
+
+    // PERFORMANCE OPTIMIZATION: Invalidate cache on state change
+    this.cachedMetrics = null
 
     this.logStateChange(previousState, 'HALF_OPEN', 'Circuit breaker attempting recovery')
   }
@@ -315,28 +393,58 @@ export class CircuitBreaker {
   }
 
   /**
-   * Get current metrics
+   * PERFORMANCE OPTIMIZATION: Get cached metrics to avoid recalculation
    */
-  getMetrics(): CircuitBreakerMetrics {
-    const recentFailures = this.recentRequests.filter(req => !req.success).length
-    const recentTotal = this.recentRequests.length
+  private getCachedMetrics(): { failureRate: number; averageResponseTime: number } {
+    const now = Date.now()
+
+    // Return cached metrics if still valid
+    if (this.cachedMetrics && (now - this.cachedMetrics.lastCalculated) < CircuitBreaker.CACHE_TTL_MS) {
+      return {
+        failureRate: this.cachedMetrics.failureRate,
+        averageResponseTime: this.cachedMetrics.averageResponseTime
+      }
+    }
+
+    // Calculate fresh metrics
+    const cutoff = now - this.config.monitoringWindow
+    const recentRequests = this.recentRequests.filter(req => req.timestamp > cutoff)
+
+    const recentFailures = recentRequests.filter(req => !req.success).length
+    const recentTotal = recentRequests.length
     const failureRate = recentTotal > 0 ? recentFailures / recentTotal : 0
 
-    const averageResponseTime = this.recentRequests.length > 0
-      ? this.recentRequests.reduce((sum, req) => sum + req.duration, 0) / this.recentRequests.length
+    const averageResponseTime = recentRequests.length > 0
+      ? recentRequests.reduce((sum, req) => sum + req.duration, 0) / recentRequests.length
       : 0
+
+    // Cache the results
+    this.cachedMetrics = {
+      failureRate,
+      averageResponseTime,
+      lastCalculated: now
+    }
+
+    return { failureRate, averageResponseTime }
+  }
+
+  /**
+   * Get current metrics with performance optimizations
+   */
+  getMetrics(): CircuitBreakerMetrics {
+    const cachedMetrics = this.getCachedMetrics()
 
     return {
       state: this.state,
       failureCount: this.failureCount,
       successCount: this.successCount,
       totalRequests: this.totalRequests,
-      failureRate,
+      failureRate: cachedMetrics.failureRate,
       lastFailureTime: this.lastFailureTime,
       lastSuccessTime: this.lastSuccessTime,
       stateChanges: this.stateChanges,
       timeInCurrentState: Date.now() - this.stateChangeTime,
-      averageResponseTime
+      averageResponseTime: cachedMetrics.averageResponseTime
     }
   }
 
@@ -372,7 +480,10 @@ export class CircuitBreaker {
     this.lastSuccessTime = 0
     this.stateChangeTime = Date.now()
     this.stateChanges++
-    this.recentRequests = []
+
+    // PERFORMANCE OPTIMIZATION: Clear circular buffer and cache
+    this.recentRequests.clear()
+    this.cachedMetrics = null
 
     this.logStateChange(previousState, 'CLOSED', 'Circuit breaker reset')
   }

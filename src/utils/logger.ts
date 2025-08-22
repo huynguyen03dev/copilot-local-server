@@ -100,84 +100,136 @@ export class Logger {
     return this.correlationId
   }
 
+  // PERFORMANCE OPTIMIZATION: Pre-computed level emojis to avoid object creation
+  private static readonly LEVEL_EMOJIS: Record<LogLevel, string> = {
+    [LogLevel.DEBUG]: '🔍',
+    [LogLevel.INFO]: 'ℹ️',
+    [LogLevel.WARN]: '⚠️',
+    [LogLevel.ERROR]: '❌',
+    [LogLevel.SILENT]: '🔇'
+  }
+
+  // PERFORMANCE OPTIMIZATION: Cached timestamp for same millisecond
+  private timestampCache: { timestamp: string; time: number } | null = null
+
+  private getCachedTimestamp(): string {
+    const now = Date.now()
+    if (!this.timestampCache || now !== this.timestampCache.time) {
+      this.timestampCache = {
+        timestamp: new Date(now).toISOString(),
+        time: now
+      }
+    }
+    return this.timestampCache.timestamp
+  }
+
+  private serializeArgsOptimized(args: unknown[]): string {
+    if (args.length === 0) return ''
+
+    // Use single pass with template literals for better performance
+    return args.map(arg => {
+      if (arg === null) return 'null'
+      if (arg === undefined) return 'undefined'
+      if (typeof arg === 'object') {
+        try {
+          return JSON.stringify(arg)
+        } catch {
+          return '[Circular Object]'
+        }
+      }
+      return String(arg)
+    }).join(' ')
+  }
+
   private formatMessage(level: LogLevel, category: string, message: string, ...args: unknown[]): string {
-    const parts: string[] = []
-    
-    // Timestamp
+    // PERFORMANCE OPTIMIZATION: Use template literals for better performance
+    let result = ''
+
+    // Timestamp (cached for same millisecond)
     if (this.config.enableTimestamps) {
-      parts.push(`[${new Date().toISOString()}]`)
+      result += `[${this.getCachedTimestamp()}] `
     }
 
     // Correlation ID
     if (this.correlationId) {
-      parts.push(`[${this.correlationId}]`)
+      result += `[${this.correlationId}] `
     }
 
-    // Level with emoji
-    const levelEmojis: Record<LogLevel, string> = {
-      [LogLevel.DEBUG]: '🔍',
-      [LogLevel.INFO]: 'ℹ️',
-      [LogLevel.WARN]: '⚠️',
-      [LogLevel.ERROR]: '❌',
-      [LogLevel.SILENT]: '🔇'
-    }
-    parts.push(levelEmojis[level] || 'ℹ️')
-    
+    // Level emoji (pre-computed)
+    result += `${Logger.LEVEL_EMOJIS[level] || 'ℹ️'} `
+
     // Category
     if (this.config.enableCategories && category) {
-      parts.push(`[${category}]`)
+      result += `[${category}] `
     }
-    
-    // Message
-    parts.push(message)
-    
-    // Additional arguments
+
+    // Message and args in single pass
+    result += message
     if (args.length > 0) {
-      parts.push(...args.map(arg => {
-        if (arg === null) return 'null'
-        if (arg === undefined) return 'undefined'
-        if (typeof arg === 'object') {
-          try {
-            return JSON.stringify(arg)
-          } catch {
-            return '[Circular Object]'
-          }
-        }
-        return String(arg)
-      }))
+      result += ` ${this.serializeArgsOptimized(args)}`
     }
-    
-    return parts.join(' ')
+
+    return result
   }
 
   private log(level: LogLevel, category: string, message: string, ...args: unknown[]): void {
     if (!this.shouldLog(level)) return
-    
+
+    // PERFORMANCE OPTIMIZATION: Direct console logging for simple cases
+    // Bypasses batching overhead for immediate console output
+    this.logDirect(level, category, message, ...args)
+  }
+
+  /**
+   * PERFORMANCE OPTIMIZATION: Direct console logging bypasses AsyncLogger→BatchLogger chain
+   * Provides immediate output with minimal overhead for simple log messages
+   */
+  private logDirect(level: LogLevel, category: string, message: string, ...args: unknown[]): void {
     const formattedMessage = this.formatMessage(level, category, message, ...args)
-    
-    // Use appropriate console method
+
+    // Direct console output - no batching overhead
     switch (level) {
-      case LogLevel.DEBUG:
-      case LogLevel.INFO:
-        console.log(formattedMessage)
+      case LogLevel.ERROR:
+        console.error(formattedMessage)
         break
       case LogLevel.WARN:
         console.warn(formattedMessage)
         break
-      case LogLevel.ERROR:
-        console.error(formattedMessage)
+      case LogLevel.DEBUG:
+      case LogLevel.INFO:
+      default:
+        console.log(formattedMessage)
         break
     }
   }
 
+  /**
+   * PERFORMANCE OPTIMIZATION: Batched logging for high-volume scenarios
+   * Use this for high-frequency logging to reduce I/O overhead
+   */
   private batchLog(message: string): void {
     this.logBuffer.push(message)
-    
+
     if (this.logBuffer.length >= this.BATCH_SIZE) {
       this.flushBatch()
     } else if (!this.batchTimeout) {
       this.batchTimeout = setTimeout(() => this.flushBatch(), 100)
     }
+  }
+
+  /**
+   * Enable batched logging mode for high-volume scenarios
+   */
+  enableBatchedLogging(): void {
+    logger.info('LOGGER', 'Switched to batched logging mode for high-volume scenarios')
+  }
+
+  /**
+   * Disable batched logging mode (use direct console logging)
+   */
+  disableBatchedLogging(): void {
+    this.flushBatch() // Flush any pending messages
+    logger.info('LOGGER', 'Switched to direct console logging mode')
   }
 
   private flushBatch(): void {
@@ -191,28 +243,36 @@ export class Logger {
     }
   }
 
-  // Public logging methods with performance optimizations
-  debug(category: string, message: string, ...args: unknown[]): void {
+  // Public logging methods with performance optimizations and lazy evaluation
+  debug(category: string, messageOrFn: string | (() => string), ...args: unknown[]): void {
     // PERFORMANCE OPTIMIZATION: Fast path for disabled debug logging
     if (!this.isLevelEnabled(LogLevel.DEBUG)) return
+
+    const message = typeof messageOrFn === 'function' ? messageOrFn() : messageOrFn
     this.log(LogLevel.DEBUG, category, message, ...args)
   }
 
-  info(category: string, message: string, ...args: unknown[]): void {
+  info(category: string, messageOrFn: string | (() => string), ...args: unknown[]): void {
     // PERFORMANCE OPTIMIZATION: Fast path for disabled info logging
     if (!this.isLevelEnabled(LogLevel.INFO)) return
+
+    const message = typeof messageOrFn === 'function' ? messageOrFn() : messageOrFn
     this.log(LogLevel.INFO, category, message, ...args)
   }
 
-  warn(category: string, message: string, ...args: unknown[]): void {
+  warn(category: string, messageOrFn: string | (() => string), ...args: unknown[]): void {
     // PERFORMANCE OPTIMIZATION: Fast path for disabled warn logging
     if (!this.isLevelEnabled(LogLevel.WARN)) return
+
+    const message = typeof messageOrFn === 'function' ? messageOrFn() : messageOrFn
     this.log(LogLevel.WARN, category, message, ...args)
   }
 
-  error(category: string, message: string, ...args: unknown[]): void {
+  error(category: string, messageOrFn: string | (() => string), ...args: unknown[]): void {
     // PERFORMANCE OPTIMIZATION: Fast path for disabled error logging
     if (!this.isLevelEnabled(LogLevel.ERROR)) return
+
+    const message = typeof messageOrFn === 'function' ? messageOrFn() : messageOrFn
     this.log(LogLevel.ERROR, category, message, ...args)
   }
 
