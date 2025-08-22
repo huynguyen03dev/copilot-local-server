@@ -176,10 +176,94 @@ export class EndpointCacheManager {
     return (current * (count - 1) + newValue) / count
   }
 
+  /**
+   * PERFORMANCE OPTIMIZATION: Perform health checks on cached endpoints
+   * Proactively validates cached endpoints to prevent stale cache hits
+   */
   private async performHealthChecks(): Promise<void> {
-    // Implement periodic health checks for cached endpoints
-    // This is a placeholder for future implementation
-    logger.debug('ENDPOINT_CACHE', 'Performing health checks...')
+    const healthyEndpoints: string[] = []
+    const unhealthyEndpoints: string[] = []
+
+    logger.debug('ENDPOINT_CACHE', `Starting health checks for ${this.cache.size} cached endpoints`)
+
+    // Check each cached endpoint
+    for (const [cacheKey, cached] of this.cache.entries()) {
+      try {
+        // Perform lightweight HEAD request to check endpoint health
+        const response = await fetch(cached.url, {
+          method: 'HEAD',
+          headers: {
+            'User-Agent': 'GitHubCopilotChat/0.26.7'
+          },
+          signal: AbortSignal.timeout(5000) // 5 second timeout
+        })
+
+        if (response.ok) {
+          // Endpoint is healthy - reduce failure count
+          if (cached.failureCount > 0) {
+            cached.failureCount = Math.max(0, cached.failureCount - 1)
+            logger.debug('ENDPOINT_CACHE', `Health check passed for ${cached.url}, reduced failure count to ${cached.failureCount}`)
+          }
+          healthyEndpoints.push(cached.url)
+        } else {
+          // Endpoint returned error - increment failure count
+          cached.failureCount++
+          logger.warn('ENDPOINT_CACHE', `Health check failed for ${cached.url} (HTTP ${response.status}), failure count: ${cached.failureCount}`)
+
+          // Remove from cache if too many failures
+          if (cached.failureCount >= this.MAX_FAILURE_COUNT) {
+            this.cache.delete(cacheKey)
+            logger.error('ENDPOINT_CACHE', `Removed unhealthy endpoint from cache: ${cached.url}`)
+          }
+          unhealthyEndpoints.push(cached.url)
+        }
+      } catch (error) {
+        // Network error or timeout - increment failure count
+        cached.failureCount++
+        logger.warn('ENDPOINT_CACHE', `Health check error for ${cached.url}: ${error}, failure count: ${cached.failureCount}`)
+
+        // Remove from cache if too many failures
+        if (cached.failureCount >= this.MAX_FAILURE_COUNT) {
+          this.cache.delete(cacheKey)
+          logger.error('ENDPOINT_CACHE', `Removed unreachable endpoint from cache: ${cached.url}`)
+        }
+        unhealthyEndpoints.push(cached.url)
+      }
+
+      // Small delay between checks to avoid overwhelming endpoints
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+
+    if (healthyEndpoints.length > 0 || unhealthyEndpoints.length > 0) {
+      logger.info('ENDPOINT_CACHE',
+        `Health check completed: ${healthyEndpoints.length} healthy, ${unhealthyEndpoints.length} unhealthy endpoints`
+      )
+    }
+  }
+
+  /**
+   * PERFORMANCE OPTIMIZATION: Start periodic health checks
+   * Schedules regular health checks to maintain cache freshness
+   */
+  startPeriodicHealthChecks(intervalMs: number = 300000): NodeJS.Timeout {
+    // Default to 5 minutes between health checks
+    logger.info('ENDPOINT_CACHE', `Starting periodic health checks every ${intervalMs / 1000} seconds`)
+
+    return setInterval(async () => {
+      try {
+        await this.performHealthChecks()
+      } catch (error) {
+        logger.error('ENDPOINT_CACHE', `Health check cycle failed: ${error}`)
+      }
+    }, intervalMs)
+  }
+
+  /**
+   * Stop periodic health checks
+   */
+  stopPeriodicHealthChecks(timer: NodeJS.Timeout): void {
+    clearInterval(timer)
+    logger.info('ENDPOINT_CACHE', 'Stopped periodic health checks')
   }
 }
 

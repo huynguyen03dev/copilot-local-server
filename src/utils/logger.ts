@@ -79,6 +79,14 @@ export class Logger {
   }
 
   /**
+   * PERFORMANCE OPTIMIZATION: Fast path for disabled log levels
+   * Avoids expensive string formatting when logging is disabled
+   */
+  private isLevelEnabled(level: LogLevel): boolean {
+    return this.shouldLog(level)
+  }
+
+  /**
    * Set correlation ID for request tracking
    */
   setCorrelationId(id: string | null): void {
@@ -183,31 +191,41 @@ export class Logger {
     }
   }
 
-  // Public logging methods
+  // Public logging methods with performance optimizations
   debug(category: string, message: string, ...args: unknown[]): void {
+    // PERFORMANCE OPTIMIZATION: Fast path for disabled debug logging
+    if (!this.isLevelEnabled(LogLevel.DEBUG)) return
     this.log(LogLevel.DEBUG, category, message, ...args)
   }
 
   info(category: string, message: string, ...args: unknown[]): void {
+    // PERFORMANCE OPTIMIZATION: Fast path for disabled info logging
+    if (!this.isLevelEnabled(LogLevel.INFO)) return
     this.log(LogLevel.INFO, category, message, ...args)
   }
 
   warn(category: string, message: string, ...args: unknown[]): void {
+    // PERFORMANCE OPTIMIZATION: Fast path for disabled warn logging
+    if (!this.isLevelEnabled(LogLevel.WARN)) return
     this.log(LogLevel.WARN, category, message, ...args)
   }
 
   error(category: string, message: string, ...args: unknown[]): void {
+    // PERFORMANCE OPTIMIZATION: Fast path for disabled error logging
+    if (!this.isLevelEnabled(LogLevel.ERROR)) return
     this.log(LogLevel.ERROR, category, message, ...args)
   }
 
-  // Specialized logging methods for streaming
+  // Specialized logging methods for streaming with performance optimizations
   streamStart(streamId: string, activeCount: number, maxStreams: number): void {
-    if (!this.config.enableProgressLogs) return
+    // PERFORMANCE OPTIMIZATION: Fast path for disabled progress logs
+    if (!this.config.enableProgressLogs || !this.isLevelEnabled(LogLevel.INFO)) return
     this.info('STREAM', `📈 Stream ${streamId} started. Active: ${activeCount}/${maxStreams}`)
   }
 
   streamEnd(streamId: string, activeCount: number, maxStreams: number): void {
-    if (!this.config.enableProgressLogs) return
+    // PERFORMANCE OPTIMIZATION: Fast path for disabled progress logs
+    if (!this.config.enableProgressLogs || !this.isLevelEnabled(LogLevel.INFO)) return
     this.info('STREAM', `📉 Stream ${streamId} ended. Active: ${activeCount}/${maxStreams}`)
   }
 

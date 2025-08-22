@@ -51,12 +51,23 @@ export class PerformanceLogger {
   private performanceEntries: PerformanceEntry[] = []
   private operationStats = new Map<string, PerformanceStats>()
   private requestCounts = new Map<number, number>() // timestamp -> count
-  private readonly MAX_ENTRIES = 10000
+
+  // PERFORMANCE OPTIMIZATION: Configurable memory limits for educational use
+  private readonly MAX_ENTRIES = parseInt(process.env.PERF_LOG_MAX_ENTRIES || '2000') // Reduced from 10000
+  private readonly SAMPLING_RATE = parseFloat(process.env.PERF_LOG_SAMPLING_RATE || '1.0') // 1.0 = 100%, 0.1 = 10%
   private readonly STATS_WINDOW_MS = 60000 // 1 minute
+
+  // Sampling state
+  private sampleCounter = 0
 
   constructor(asyncLogger?: AsyncLogger) {
     this.asyncLogger = asyncLogger || createAsyncLogger()
     this.startPeriodicCleanup()
+
+    // PERFORMANCE OPTIMIZATION: Log memory configuration for educational purposes
+    logger.info('PERFORMANCE_LOGGER',
+      `📊 Initialized with MAX_ENTRIES=${this.MAX_ENTRIES}, SAMPLING_RATE=${this.SAMPLING_RATE * 100}%`
+    )
   }
 
   /**
@@ -68,17 +79,28 @@ export class PerformanceLogger {
 
   /**
    * Record performance entry
+   * PERFORMANCE OPTIMIZATION: Added sampling to reduce memory pressure
    */
   async recordPerformance(entry: PerformanceEntry): Promise<void> {
-    // Add to entries list
-    this.performanceEntries.push(entry)
+    // PERFORMANCE OPTIMIZATION: Apply sampling to reduce memory usage
+    this.sampleCounter++
+    const shouldSample = this.SAMPLING_RATE >= 1.0 || (this.sampleCounter % Math.ceil(1 / this.SAMPLING_RATE)) === 0
 
-    // Maintain max entries limit
-    if (this.performanceEntries.length > this.MAX_ENTRIES) {
-      this.performanceEntries.shift()
+    if (shouldSample) {
+      // Add to entries list
+      this.performanceEntries.push(entry)
+
+      // Maintain max entries limit with batch removal for efficiency
+      if (this.performanceEntries.length > this.MAX_ENTRIES) {
+        // Remove oldest 10% when limit is exceeded
+        const toRemove = Math.floor(this.MAX_ENTRIES * 0.1)
+        this.performanceEntries.splice(0, toRemove)
+
+        logger.debug('PERFORMANCE_LOGGER', `Removed ${toRemove} old performance entries (memory optimization)`)
+      }
     }
 
-    // Update operation statistics
+    // Always update operation statistics (even for non-sampled entries)
     this.updateOperationStats(entry)
 
     // Log performance entry
@@ -305,6 +327,29 @@ export class PerformanceLogger {
    */
   async flush(): Promise<void> {
     await this.asyncLogger.flush()
+  }
+
+  /**
+   * PERFORMANCE OPTIMIZATION: Get memory usage statistics
+   * Provides insights into performance logger memory consumption
+   */
+  getMemoryStats(): {
+    entriesCount: number
+    maxEntries: number
+    memoryUtilization: number
+    samplingRate: number
+    estimatedMemoryUsage: number
+  } {
+    const estimatedBytesPerEntry = 200 // Rough estimate
+    const estimatedMemoryUsage = this.performanceEntries.length * estimatedBytesPerEntry
+
+    return {
+      entriesCount: this.performanceEntries.length,
+      maxEntries: this.MAX_ENTRIES,
+      memoryUtilization: this.performanceEntries.length / this.MAX_ENTRIES,
+      samplingRate: this.SAMPLING_RATE,
+      estimatedMemoryUsage
+    }
   }
 
   /**

@@ -9,6 +9,7 @@ A local API server that exposes GitHub Copilot as an OpenAI-compatible endpoint 
 
 - **OpenAI-Compatible API** - Educational example of API compatibility layers
 - **GitHub OAuth Flow** - Learn device flow authentication patterns
+- **Client Compatibility** - Role normalization for Cline, Continue.dev, and other AI clients
 - **Performance Optimizations** - Connection pooling, caching, compression
 - **Local Development** - Safe learning environment on your machine
 - **Cross-Platform** - Works on Windows, macOS, and Linux

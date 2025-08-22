@@ -3,11 +3,17 @@ import { logger } from "./logger"
 
 /**
  * Content transformation cache for optimized processing
+ * PERFORMANCE OPTIMIZATION: Enhanced with hit/miss tracking and proper LRU eviction
  */
 class ContentTransformationCache {
-  private cache = new Map<string, any>()
+  private cache = new Map<string, { result: any, timestamp: number, lastAccessed: number }>()
   private readonly MAX_CACHE_SIZE = 1000
   private readonly CACHE_TTL = 300000 // 5 minutes
+
+  // PERFORMANCE OPTIMIZATION: Hit/miss tracking for cache effectiveness monitoring
+  private hitCount = 0
+  private missCount = 0
+  private evictionCount = 0
 
   /**
    * Generate cache key from content
@@ -26,39 +32,73 @@ class ContentTransformationCache {
 
   /**
    * Get cached transformation result
+   * PERFORMANCE OPTIMIZATION: Enhanced with hit/miss tracking and LRU access time update
    */
   get(content: string | ContentBlock[]): any | null {
     const key = this.generateKey(content)
     const cached = this.cache.get(key)
 
     if (cached && Date.now() - cached.timestamp < this.CACHE_TTL) {
-      logger.debug('CONTENT_CACHE', `Cache hit for content transformation`)
+      // Cache hit - update access time for LRU and increment hit counter
+      cached.lastAccessed = Date.now()
+      this.cache.set(key, cached) // Update the entry to maintain insertion order
+      this.hitCount++
+
+      logger.debug('CONTENT_CACHE', `✅ Cache hit for content transformation (${this.getHitRate().toFixed(2)}% hit rate)`)
       return cached.result
     }
 
     if (cached) {
       this.cache.delete(key) // Remove expired entry
+      logger.debug('CONTENT_CACHE', `🕐 Expired cache entry removed`)
     }
 
+    // Cache miss
+    this.missCount++
+    logger.debug('CONTENT_CACHE', `❌ Cache miss for content transformation (${this.getHitRate().toFixed(2)}% hit rate)`)
     return null
   }
 
   /**
    * Store transformation result in cache
+   * PERFORMANCE OPTIMIZATION: Enhanced with proper LRU eviction strategy
    */
   set(content: string | ContentBlock[], result: any): void {
-    // Prevent cache from growing too large
+    const key = this.generateKey(content)
+    const now = Date.now()
+
+    // PERFORMANCE OPTIMIZATION: Proper LRU eviction - remove multiple entries if needed
     if (this.cache.size >= this.MAX_CACHE_SIZE) {
-      // Remove oldest entries (simple LRU)
-      const oldestKey = this.cache.keys().next().value
-      this.cache.delete(oldestKey)
+      this.evictLRUEntries()
     }
 
-    const key = this.generateKey(content)
     this.cache.set(key, {
       result,
-      timestamp: Date.now()
+      timestamp: now,
+      lastAccessed: now
     })
+
+    logger.debug('CONTENT_CACHE', `📦 Cached content transformation result (cache size: ${this.cache.size}/${this.MAX_CACHE_SIZE})`)
+  }
+
+  /**
+   * PERFORMANCE OPTIMIZATION: Evict least recently used entries
+   * Removes oldest 20% of entries to make room for new ones
+   */
+  private evictLRUEntries(): void {
+    const entries = Array.from(this.cache.entries())
+
+    // Sort by last accessed time (oldest first)
+    entries.sort((a, b) => a[1].lastAccessed - b[1].lastAccessed)
+
+    // Remove oldest 20% of entries
+    const toRemove = Math.max(1, Math.floor(entries.length * 0.2))
+    for (let i = 0; i < toRemove; i++) {
+      this.cache.delete(entries[i][0])
+      this.evictionCount++
+    }
+
+    logger.debug('CONTENT_CACHE', `🗑️ Evicted ${toRemove} LRU cache entries`)
   }
 
   /**
@@ -69,17 +109,34 @@ class ContentTransformationCache {
   }
 
   /**
+   * PERFORMANCE OPTIMIZATION: Get hit rate percentage
+   */
+  getHitRate(): number {
+    const totalRequests = this.hitCount + this.missCount
+    return totalRequests > 0 ? (this.hitCount / totalRequests) * 100 : 0
+  }
+
+  /**
    * Get cache statistics
+   * PERFORMANCE OPTIMIZATION: Enhanced with actual hit/miss tracking
    */
   getStats(): {
     size: number
     maxSize: number
     hitRate: number
+    hitCount: number
+    missCount: number
+    evictionCount: number
+    totalRequests: number
   } {
     return {
       size: this.cache.size,
       maxSize: this.MAX_CACHE_SIZE,
-      hitRate: 0 // TODO: Implement hit rate tracking
+      hitRate: this.getHitRate(),
+      hitCount: this.hitCount,
+      missCount: this.missCount,
+      evictionCount: this.evictionCount,
+      totalRequests: this.hitCount + this.missCount
     }
   }
 }

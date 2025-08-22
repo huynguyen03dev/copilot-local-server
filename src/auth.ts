@@ -326,14 +326,20 @@ export class GitHubCopilotAuth {
       console.log(`🌐 Opening browser for authentication...`)
       console.log(`🔑 Device code: ${authData.user}`)
 
-      // Step 2: Automatically open browser
-      const browserOpened = await this.openBrowser(authData.verification)
-      if (browserOpened) {
-        console.log("✅ Browser opened - please complete authentication")
-      } else {
+      // Step 2: Fire-and-forget browser opening (PERFORMANCE OPTIMIZATION)
+      // Don't await browser opening to prevent any blocking in authentication flow
+      void this.openBrowser(authData.verification).then(browserOpened => {
+        if (browserOpened) {
+          console.log("✅ Browser opened - please complete authentication")
+        } else {
+          console.log(`⚠️  Please manually visit: ${authData.verification}`)
+          console.log(`🔑 Enter code: ${authData.user}`)
+        }
+      }).catch(() => {
+        // Silently handle browser opening failures - don't block auth flow
         console.log(`⚠️  Please manually visit: ${authData.verification}`)
         console.log(`🔑 Enter code: ${authData.user}`)
-      }
+      })
 
       console.log("⏳ Waiting for authentication (this may take a few minutes)...")
 
@@ -428,15 +434,21 @@ export class GitHubCopilotAuth {
       console.log(`🔑 Your device code: ${authData.user}`)
       console.log(`⏱️  Code expires in ${Math.floor(authData.expiry / 60)} minutes\n`)
 
-      // Step 1.5: Automatically open browser
-      const browserOpened = await this.openBrowser(authData.verification)
-      if (browserOpened) {
-        console.log("✅ Browser opened automatically")
-        console.log(`💡 If the page didn't load, manually visit: ${authData.verification}`)
-      } else {
+      // Step 1.5: Fire-and-forget browser opening (PERFORMANCE OPTIMIZATION)
+      // Don't await browser opening to prevent any blocking in authentication flow
+      void this.openBrowser(authData.verification).then(browserOpened => {
+        if (browserOpened) {
+          console.log("✅ Browser opened automatically")
+          console.log(`💡 If the page didn't load, manually visit: ${authData.verification}`)
+        } else {
+          console.log("⚠️  Could not open browser automatically")
+          console.log(`🔗 Please manually visit: ${authData.verification}`)
+        }
+      }).catch(() => {
+        // Silently handle browser opening failures - don't block auth flow
         console.log("⚠️  Could not open browser automatically")
         console.log(`🔗 Please manually visit: ${authData.verification}`)
-      }
+      })
 
       console.log(`\n🔑 Enter this code in your browser: ${authData.user}`)
       console.log("⏳ Waiting for you to complete authentication...\n")

@@ -178,9 +178,77 @@ describe("Enhanced Integration Tests", () => {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(request)
         })
-        
+
         expect(response.status).toBe(400)
       }
+    })
+
+    it("should normalize message roles for client compatibility", async () => {
+      // Test various role formats that clients like Cline might send
+      const roleTestCases = [
+        { input: "System", expected: "system" },
+        { input: "User", expected: "user" },
+        { input: "Assistant", expected: "assistant" },
+        { input: "SYSTEM", expected: "system" },
+        { input: "human", expected: "user" },
+        { input: "ai", expected: "assistant" },
+        { input: "bot", expected: "assistant" },
+        { input: " user ", expected: "user" }
+      ]
+
+      for (const { input, expected } of roleTestCases) {
+        const request = {
+          model: "gpt-4",
+          messages: [
+            { role: input, content: "Test message with normalized role" }
+          ]
+        }
+
+        const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(request)
+        })
+
+        // Should succeed with normalized role
+        expect(response.status).toBe(200)
+
+        const data = await response.json()
+        expect(data.choices).toBeDefined()
+        expect(data.choices.length).toBeGreaterThan(0)
+      }
+    })
+
+    it("should handle Cline-style requests", async () => {
+      // Simulate a typical Cline request format
+      const clineRequest = {
+        model: "gpt-4",
+        messages: [
+          {
+            role: "System", // Capitalized role (common in Cline)
+            content: "You are Cline, a helpful AI assistant that can help with coding tasks."
+          },
+          {
+            role: "User", // Capitalized role
+            content: "Hello, can you help me write a function?"
+          }
+        ],
+        temperature: 0.7,
+        max_tokens: 150
+      }
+
+      const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(clineRequest)
+      })
+
+      expect(response.status).toBe(200)
+
+      const data = await response.json()
+      expect(data.choices).toBeDefined()
+      expect(data.choices.length).toBeGreaterThan(0)
+      expect(data.choices[0].message.role).toBe("assistant")
     })
 
     it("should validate parameter ranges", async () => {

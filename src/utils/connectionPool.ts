@@ -3,7 +3,7 @@
  * Manages persistent HTTP connections to reduce network latency
  */
 
-import { Agent, Pool, request } from 'undici'
+import { Pool, request } from 'undici'
 import { logger } from './logger'
 import {
   getCircuitBreakerManager,
@@ -29,13 +29,22 @@ export interface PoolStats {
   totalRequests: number
   totalErrors: number
   averageResponseTime: number
+  // PERFORMANCE OPTIMIZATION: Queue metrics for concurrency control
+  queuedRequests: number
+  averageQueueTime: number
+  connectionUtilization: number
 }
 
 export class ConnectionPoolManager {
   private pools = new Map<string, Pool>()
-  private globalAgent: Agent
   private config: ConnectionPoolConfig
   private stats = new Map<string, PoolStats>()
+
+  // PERFORMANCE OPTIMIZATION: Per-origin concurrency control
+  // Enforces maxConcurrentRequests to prevent burst overload and stabilize latency
+  private inFlightCount = new Map<string, number>()
+  private waitQueues = new Map<string, Array<{ resolve: () => void, timestamp: number }>>()
+  private queueStats = new Map<string, { totalWaits: number, totalWaitTime: number }>()
 
   constructor(config?: Partial<ConnectionPoolConfig>) {
     this.config = {
@@ -55,17 +64,7 @@ export class ConnectionPoolManager {
       ...config
     }
 
-    // Create global agent for connection pooling
-    this.globalAgent = new Agent({
-      connections: this.config.maxConnections,
-      keepAliveTimeout: this.config.keepAliveTimeout,
-      keepAliveMaxTimeout: this.config.keepAliveMaxTimeout,
-      connect: {
-        timeout: this.config.connectTimeout
-      }
-    })
-
-    logger.info('CONNECTION_POOL', `Initialized with ${this.config.maxConnections} max connections`)
+    logger.info('CONNECTION_POOL', `Initialized with ${this.config.maxConnections} max connections per origin`)
   }
 
   /**
@@ -88,7 +87,10 @@ export class ConnectionPoolManager {
         pendingRequests: 0,
         totalRequests: 0,
         totalErrors: 0,
-        averageResponseTime: 0
+        averageResponseTime: 0,
+        queuedRequests: 0,
+        averageQueueTime: 0,
+        connectionUtilization: 0
       })
 
       logger.debug('CONNECTION_POOL', `Created new pool for ${origin}`)
@@ -98,7 +100,106 @@ export class ConnectionPoolManager {
   }
 
   /**
+   * PERFORMANCE OPTIMIZATION: Acquire semaphore for origin
+   * Enforces maxConcurrentRequests to prevent overload and stabilize latency
+   */
+  private async acquire(origin: string): Promise<void> {
+    const currentInFlight = this.inFlightCount.get(origin) || 0
+
+    if (currentInFlight < this.config.maxConcurrentRequests) {
+      // Fast path: can proceed immediately
+      this.inFlightCount.set(origin, currentInFlight + 1)
+
+      // Update stats - track as active connection
+      const stats = this.stats.get(origin)
+      if (stats) {
+        stats.activeConnections++
+      }
+
+      this.updateDerivedStats(origin)
+      return
+    }
+
+    // Slow path: must wait in queue
+    const startWaitTime = Date.now()
+
+    return new Promise<void>((resolve) => {
+      const queue = this.waitQueues.get(origin) || []
+      queue.push({ resolve, timestamp: startWaitTime })
+      this.waitQueues.set(origin, queue)
+
+      logger.debug('CONNECTION_POOL', `Request queued for ${origin}, queue length: ${queue.length}`)
+    })
+  }
+
+  /**
+   * PERFORMANCE OPTIMIZATION: Update derived stats for origin
+   * Calculates queue metrics and connection utilization
+   */
+  private updateDerivedStats(origin: string): void {
+    const stats = this.stats.get(origin)
+    if (!stats) return
+
+    const queue = this.waitQueues.get(origin) || []
+    const queueStat = this.queueStats.get(origin) || { totalWaits: 0, totalWaitTime: 0 }
+
+    stats.queuedRequests = queue.length
+    stats.averageQueueTime = queueStat.totalWaits > 0 ? queueStat.totalWaitTime / queueStat.totalWaits : 0
+    stats.connectionUtilization = stats.activeConnections / this.config.maxConnections
+  }
+
+  /**
+   * PERFORMANCE OPTIMIZATION: Release semaphore for origin
+   * Decrements in-flight count and processes next queued request
+   */
+  private release(origin: string): void {
+    const currentInFlight = this.inFlightCount.get(origin) || 0
+
+    if (currentInFlight > 0) {
+      this.inFlightCount.set(origin, currentInFlight - 1)
+
+      // Update stats - track as released connection
+      const stats = this.stats.get(origin)
+      if (stats) {
+        stats.activeConnections = Math.max(0, stats.activeConnections - 1)
+      }
+    }
+
+    // Process next queued request if any
+    const queue = this.waitQueues.get(origin) || []
+    if (queue.length > 0) {
+      const next = queue.shift()!
+      this.waitQueues.set(origin, queue)
+
+      // Update in-flight count for the released request
+      this.inFlightCount.set(origin, (this.inFlightCount.get(origin) || 0) + 1)
+
+      // Update stats for the newly active connection
+      const stats = this.stats.get(origin)
+      if (stats) {
+        stats.activeConnections++
+      }
+
+      // Track queue wait time
+      const waitTime = Date.now() - next.timestamp
+      const queueStat = this.queueStats.get(origin) || { totalWaits: 0, totalWaitTime: 0 }
+      queueStat.totalWaits++
+      queueStat.totalWaitTime += waitTime
+      this.queueStats.set(origin, queueStat)
+
+      logger.debug('CONNECTION_POOL', `Released queued request for ${origin}, waited ${waitTime}ms`)
+
+      // Resolve the waiting request
+      next.resolve()
+    }
+
+    // Update derived stats after any changes
+    this.updateDerivedStats(origin)
+  }
+
+  /**
    * Make an HTTP request using connection pooling
+   * @param signal - AbortSignal for cancelling the request (performance optimization for parallel discovery)
    */
   async request(url: string, options: {
     method?: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD' | 'OPTIONS'
@@ -106,6 +207,7 @@ export class ConnectionPoolManager {
     body?: string | Buffer
     timeout?: number
     bypassCircuitBreaker?: boolean
+    signal?: AbortSignal  // Added for parallel endpoint discovery optimization
   } = {}): Promise<{
     statusCode: number
     headers: Record<string, string | string[]>
@@ -152,6 +254,7 @@ export class ConnectionPoolManager {
 
   /**
    * Make direct HTTP request without circuit breaker
+   * Enhanced with AbortSignal support for parallel endpoint discovery optimization
    */
   private async requestDirect(
     url: string,
@@ -167,18 +270,29 @@ export class ConnectionPoolManager {
     const pool = this.getPool(origin)
     const stats = this.stats.get(origin)!
 
+    // PERFORMANCE OPTIMIZATION: Enforce maxConcurrentRequests with semaphore
+    await this.acquire(origin)
+
     stats.pendingRequests++
     stats.totalRequests++
 
     try {
-      const response = await request(url, {
+      // Pass AbortSignal to undici for cancellable requests (parallel discovery optimization)
+      const requestOptions: any = {
         method: options.method || 'GET',
         headers: options.headers || {},
         body: options.body,
         dispatcher: pool,
         headersTimeout: options.timeout || this.config.headersTimeout,
         bodyTimeout: options.timeout || this.config.bodyTimeout
-      })
+      }
+
+      // Add signal if provided for request cancellation
+      if (options.signal) {
+        requestOptions.signal = options.signal
+      }
+
+      const response = await request(url, requestOptions)
 
       const body = await response.body.text()
       const responseTime = Date.now() - startTime
@@ -205,6 +319,9 @@ export class ConnectionPoolManager {
 
       logger.error('CONNECTION_POOL', `Request failed: ${url} - ${error}`)
       throw error
+    } finally {
+      // PERFORMANCE OPTIMIZATION: Always release semaphore to prevent deadlock
+      this.release(origin)
     }
   }
 
@@ -216,6 +333,7 @@ export class ConnectionPoolManager {
     headers?: Record<string, string>
     body?: string | Buffer
     timeout?: number
+    signal?: AbortSignal  // Added for consistency with request method
   } = {}): Promise<{
     statusCode: number
     headers: Record<string, string | string[]>
@@ -228,18 +346,28 @@ export class ConnectionPoolManager {
     const pool = this.getPool(origin)
     const stats = this.stats.get(origin)!
 
+    // PERFORMANCE OPTIMIZATION: Enforce maxConcurrentRequests with semaphore
+    await this.acquire(origin)
+
     stats.pendingRequests++
     stats.totalRequests++
 
     try {
-      const response = await request(url, {
+      // Support AbortSignal for streaming requests too
+      const requestOptions: any = {
         method: options.method || 'GET',
         headers: options.headers || {},
         body: options.body,
         dispatcher: pool,
         headersTimeout: options.timeout || this.config.headersTimeout,
         bodyTimeout: options.timeout || this.config.bodyTimeout
-      })
+      }
+
+      if (options.signal) {
+        requestOptions.signal = options.signal
+      }
+
+      const response = await request(url, requestOptions)
 
       const responseTime = Date.now() - startTime
 
@@ -262,9 +390,12 @@ export class ConnectionPoolManager {
     } catch (error) {
       stats.pendingRequests--
       stats.totalErrors++
-      
+
       logger.error('CONNECTION_POOL', `Streaming request failed: ${url} - ${error}`)
       throw error
+    } finally {
+      // PERFORMANCE OPTIMIZATION: Always release semaphore to prevent deadlock
+      this.release(origin)
     }
   }
 
@@ -278,7 +409,10 @@ export class ConnectionPoolManager {
         pendingRequests: 0,
         totalRequests: 0,
         totalErrors: 0,
-        averageResponseTime: 0
+        averageResponseTime: 0,
+        queuedRequests: 0,
+        averageQueueTime: 0,
+        connectionUtilization: 0
       }
     }
     return new Map(this.stats)
@@ -295,9 +429,51 @@ export class ConnectionPoolManager {
       pendingRequests: allStats.reduce((sum, s) => sum + s.pendingRequests, 0),
       totalRequests: allStats.reduce((sum, s) => sum + s.totalRequests, 0),
       totalErrors: allStats.reduce((sum, s) => sum + s.totalErrors, 0),
-      averageResponseTime: allStats.length > 0 
+      averageResponseTime: allStats.length > 0
         ? allStats.reduce((sum, s) => sum + s.averageResponseTime, 0) / allStats.length
+        : 0,
+      queuedRequests: allStats.reduce((sum, s) => sum + s.queuedRequests, 0),
+      averageQueueTime: allStats.length > 0
+        ? allStats.reduce((sum, s) => sum + s.averageQueueTime, 0) / allStats.length
+        : 0,
+      connectionUtilization: allStats.length > 0
+        ? allStats.reduce((sum, s) => sum + s.connectionUtilization, 0) / allStats.length
         : 0
+    }
+  }
+
+  /**
+   * PERFORMANCE OPTIMIZATION: Warmup connections to an origin
+   * Pre-establishes connections to reduce cold-hit latency
+   */
+  async warmupConnections(origin: string, count: number = 3): Promise<void> {
+    try {
+      logger.debug('CONNECTION_POOL', `Warming up ${count} connections to ${origin}`)
+
+      // Create lightweight HEAD requests to establish connections
+      const warmupPromises = Array(count).fill(null).map(async () => {
+        try {
+          const pool = this.getPool(origin)
+          // Use HEAD request with short timeout for warmup
+          await request(`${origin}/`, {
+            method: 'HEAD',
+            dispatcher: pool,
+            headersTimeout: 2000,
+            bodyTimeout: 2000
+          })
+        } catch (error) {
+          // Ignore warmup failures - they're best-effort
+          logger.debug('CONNECTION_POOL', `Warmup request failed for ${origin}: ${error}`)
+        }
+      })
+
+      // Wait for all warmup attempts (with timeout)
+      await Promise.allSettled(warmupPromises)
+
+      logger.debug('CONNECTION_POOL', `Connection warmup completed for ${origin}`)
+    } catch (error) {
+      // Warmup is best-effort, don't fail the main operation
+      logger.debug('CONNECTION_POOL', `Connection warmup error for ${origin}: ${error}`)
     }
   }
 
@@ -309,11 +485,12 @@ export class ConnectionPoolManager {
     
     const closePromises = Array.from(this.pools.values()).map(pool => pool.close())
     await Promise.all(closePromises)
-    
-    await this.globalAgent.close()
-    
+
     this.pools.clear()
     this.stats.clear()
+    this.inFlightCount.clear()
+    this.waitQueues.clear()
+    this.queueStats.clear()
     
     logger.info('CONNECTION_POOL', 'All connection pools closed')
   }

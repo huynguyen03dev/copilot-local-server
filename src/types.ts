@@ -53,15 +53,61 @@ export const ContentBlock = z.union([TextContent, ImageContent])
 
 // Updated ChatMessage to support both string and array content formats
 export const ChatMessage = z.object({
-  role: z.enum(["system", "user", "assistant"], {
-    errorMap: () => ({ message: "Role must be one of: system, user, assistant" })
-  }),
+  // COMPATIBILITY FIX: Add role normalization for Cline and other clients
+  // Handles case sensitivity and common alternative role names
+  role: z.string().transform((role) => {
+    // Normalize role to lowercase and trim whitespace
+    const normalizedRole = role.toLowerCase().trim()
+
+    // Map common alternative role names used by various AI clients
+    const roleMap: Record<string, string> = {
+      'human': 'user',        // Common in Anthropic/Claude clients
+      'ai': 'assistant',      // Common in various AI clients
+      'bot': 'assistant',     // Common in chatbot implementations
+      'model': 'assistant',   // Sometimes used for model responses
+      'chatbot': 'assistant', // Alternative assistant naming
+      'gpt': 'assistant'      // GPT-specific naming
+    }
+
+    const mappedRole = roleMap[normalizedRole] || normalizedRole
+
+    // Log role transformation for debugging (only in development)
+    if (process.env.NODE_ENV === 'development' && mappedRole !== role) {
+      console.debug(`🔄 Role normalized: "${role}" → "${mappedRole}"`)
+    }
+
+    return mappedRole
+  }).pipe(z.enum(["system", "user", "assistant"], {
+    errorMap: (issue, ctx) => {
+      const receivedValue = ctx.data
+      return {
+        message: `Role must be one of: system, user, assistant (received: "${receivedValue}")`
+      }
+    }
+  })),
   content: z.union([
     z.string().min(1, "Content cannot be empty"),                    // Legacy string format (backward compatibility)
     z.array(ContentBlock).min(1, "Content array cannot be empty")   // New array format (multi-modal support)
   ], {
     errorMap: () => ({ message: "Content must be a non-empty string or array" })
   }),
+}).refine((message) => {
+  // PERFORMANCE OPTIMIZATION: Consolidate content validation into Zod schema
+  // This eliminates redundant validation work in request handlers
+  if (typeof message.content === "string") {
+    return true // String content is always valid
+  }
+
+  if (Array.isArray(message.content)) {
+    // Ensure array content has at least one text block for GitHub Copilot compatibility
+    const hasTextContent = message.content.some(block => block.type === "text")
+    return hasTextContent
+  }
+
+  return false
+}, {
+  message: "Content array must contain at least one text block for GitHub Copilot compatibility",
+  path: ["content"]
 })
 
 export const ChatCompletionRequest = z.object({
@@ -105,7 +151,19 @@ export type ContentBlock = z.infer<typeof ContentBlock>
 
 // Streaming-specific types
 export const DeltaMessage = z.object({
-  role: z.enum(["system", "user", "assistant"]).optional(),
+  // COMPATIBILITY FIX: Apply same role normalization for streaming responses
+  role: z.string().transform((role) => {
+    const normalizedRole = role.toLowerCase().trim()
+    const roleMap: Record<string, string> = {
+      'human': 'user',
+      'ai': 'assistant',
+      'bot': 'assistant',
+      'model': 'assistant',
+      'chatbot': 'assistant',
+      'gpt': 'assistant'
+    }
+    return roleMap[normalizedRole] || normalizedRole
+  }).pipe(z.enum(["system", "user", "assistant"])).optional(),
   content: z.string().optional(),
 })
 
