@@ -7,7 +7,6 @@
   "scripts": {
     "dev": "bun run --watch src/index.ts",
     "start": "bun run src/index.ts",
-    "start:prod": "NODE_ENV=production bun run src/index.ts",
     "build": "bun build src/index.ts --outdir dist --target bun",
     "type-check": "tsc --noEmit",
     "test": "bun test",
@@ -27,9 +26,6 @@
     "test:logging": "bun run scripts/tests/test-logging.ts",
     "test:stop": "python test-stop-param.py",
     "debug": "python debug-test.py",
-    "monitor": "python scripts/monitoring-dashboard.py",
-    "monitor-perf": "python scripts/monitor-streaming.py",
-    "deploy": "chmod +x deploy.sh && ./deploy.sh",
     "auth": "bun run src/index.ts --auth",
     "clear-auth": "bun run src/index.ts --clear-auth"
   },

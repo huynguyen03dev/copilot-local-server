@@ -48,9 +48,11 @@ Server runs on `http://localhost:8069` by default.
 This project demonstrates:
 - **API Proxy Patterns** - How to create compatibility layers between different APIs
 - **OAuth Device Flow** - Modern authentication for CLI/desktop applications
-- **Performance Optimization** - Connection pooling, caching, and compression techniques
-- **Error Handling** - Circuit breakers, retries, and graceful degradation
-- **TypeScript Architecture** - Clean, type-safe API server design
+- **Performance Optimization** - Connection pooling, response compression, and intelligent caching
+- **Fault Tolerance** - Circuit breaker patterns, retries, and graceful error handling
+- **TypeScript Best Practices** - Clean architecture, type safety, and structured logging
+- **HTTP Optimization** - Keep-alive connections, response caching, and compression
+- **Memory Management** - Efficient token caching and connection pooling
 
 ## 🔧 Usage Examples
 
@@ -79,12 +81,14 @@ response = client.chat.completions.create(
 
 ## ⚙️ Configuration
 
-Basic configuration via environment variables:
+Configuration via environment variables (see `.env.example`):
 ```bash
 PORT=8069                    # Server port
-HOSTNAME=127.0.0.1          # Bind address
+HOSTNAME=127.0.0.1          # Bind address (localhost for security)
 LOG_LEVEL=info              # debug, info, warn, error
-NODE_ENV=development        # Environment mode
+ENABLE_COMPRESSION=true     # Response compression (recommended)
+CACHE_HEADERS=true          # Client-side caching (recommended)
+ENABLE_CONNECTION_POOLING=true  # HTTP connection pooling (recommended)
 ```
 
 ## 🔍 Key API Endpoints
@@ -93,21 +97,25 @@ NODE_ENV=development        # Environment mode
 - `GET /v1/models` - List available models
 - `GET /auth/status` - Check authentication status
 - `GET /` - Health check and server info
+- `GET /metrics` - Performance metrics and monitoring data
 
 ## 🛠️ Development
 
 ```bash
 bun run dev          # Development with auto-reload
-bun run build        # Build for production
+bun run build        # Build optimized bundle
 bun run type-check   # TypeScript validation
+bun test             # Run all tests
+bun run test:unit    # Unit tests only
 ```
 
 ## 🔒 Security & Disclaimers
 
 **Educational Use Only:**
-- This project is for learning API patterns and authentication flows
-- Not intended for production or commercial use
-- Demonstrates proxy server architecture and performance optimization
+- This project demonstrates best-practice API server architecture
+- Learn connection pooling, caching, compression, and fault tolerance patterns
+- Not intended for production deployment or commercial use
+- Showcases TypeScript, performance optimization, and structured logging
 
 **Security Notes:**
 - Tokens stored locally in `.auth.json` (restricted permissions)
