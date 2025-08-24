@@ -4,6 +4,13 @@ import { logger as honoLogger } from "hono/logger"
 import { streamSSE } from "hono/streaming"
 import { zValidator } from "@hono/zod-validator"
 import { GitHubCopilotAuth } from "./auth"
+import {
+  TIMEOUT_CONSTANTS,
+  PERFORMANCE_CONSTANTS,
+  HTTP_STATUS,
+  ENDPOINT_PATHS,
+  ERROR_CODES
+} from "./constants"
 
 import {
   ChatCompletionRequest,
@@ -94,7 +101,7 @@ export class CopilotAPIServer {
   private readonly MAX_CONCURRENT_STREAMS = config.server.maxConcurrentStreams
   private readonly RATE_LIMIT_INTERVAL = config.streaming.rateLimitInterval
   private readonly IS_TEST_ENVIRONMENT = process.env.NODE_ENV === 'test'
-  private readonly STREAM_TIMEOUT_MS = 5 * 60 * 1000  // 5 minutes for stuck stream detection
+  private readonly STREAM_TIMEOUT_MS = TIMEOUT_CONSTANTS.STREAM_TIMEOUT_MS
 
   // Performance monitoring
   private streamMetrics = {
@@ -620,10 +627,11 @@ export class CopilotAPIServer {
           } else {
             // Forward request to GitHub Copilot API (non-streaming)
             const copilotResponse = await this.forwardToCopilot(token, body, endpoint)
+            c.header('Content-Type', 'application/json; charset=utf-8')
             return c.json(copilotResponse)
           }
         } catch (error) {
-          console.error("Copilot API error:", error)
+          logger.error('COPILOT_API', `API request failed: ${error instanceof Error ? error.message : 'Unknown error'}`)
           const errorResponse = createAPIErrorResponse(
             error instanceof Error ? error.message : "Failed to process request",
             "api_error",
@@ -874,7 +882,7 @@ export class CopilotAPIServer {
   }
 
   private async forwardToCopilot(token: string, request: ChatCompletionRequest, endpoint: string): Promise<ChatCompletionResponse> {
-    console.log(`🔄 Transformed ${request.messages.length} message(s) for Copilot compatibility`)
+    logger.debug('COPILOT_REQUEST', `Transformed ${request.messages.length} message(s) for Copilot compatibility`)
 
     // PERFORMANCE OPTIMIZATION: Check response cache first
     // Reduces redundant upstream calls for identical requests
@@ -912,8 +920,8 @@ export class CopilotAPIServer {
         // Warmup is best-effort, don't fail the main request
       })
 
-      console.log(`🎯 Using endpoint: ${url}`)
-      console.log(`Request body:`, JSON.stringify(requestBody, null, 2))
+      logger.debug('COPILOT_REQUEST', `Using endpoint: ${url}`)
+      logger.debug('COPILOT_REQUEST', `Request body: ${JSON.stringify(requestBody, null, 2)}`)
 
       // Wrap network request in error boundary
       const networkResult = await NetworkErrorBoundary.handleRequest(
@@ -1205,7 +1213,7 @@ export class CopilotAPIServer {
     // Handle client abort with guaranteed cleanup
     let isAborted = false
     stream.onAbort(() => {
-      console.log(`🚫 Client aborted streaming request ${streamId}`)
+      logger.info('STREAM', `Client aborted streaming request ${streamId}`)
       isAborted = true
       reader.releaseLock()
       this.cleanupStreamGuaranteed(streamId, 'client abort (unified)')

@@ -3,7 +3,8 @@
  * Global test setup, mocks, and utilities
  */
 
-import { beforeAll, afterAll } from "bun:test"
+import { beforeAll, afterAll, beforeEach } from "bun:test"
+import { tokenCache } from "../src/utils/tokenCache"
 
 // Global test configuration
 beforeAll(() => {
@@ -20,6 +21,12 @@ beforeAll(() => {
   process.env.PORT = "0" // Random port
   process.env.CORS_ORIGINS = "http://localhost:3000"
   process.env.ENABLE_RATE_LIMIT = "false"
+})
+
+// Clear caches before each test to prevent interference
+beforeEach(() => {
+  // Clear token cache to prevent test interference
+  tokenCache.clearCache()
 })
 
 afterAll(() => {

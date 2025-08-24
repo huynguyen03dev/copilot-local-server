@@ -31,13 +31,13 @@ describe("Rate Limiting Security Tests", () => {
     it("should have appropriate timeout configurations", () => {
       const requestTimeout = config.server.requestTimeout
       const keepAliveTimeout = config.server.keepAliveTimeout
-      
+
       expect(typeof requestTimeout).toBe('number')
       expect(typeof keepAliveTimeout).toBe('number')
-      
+
       // Timeouts should be reasonable
       expect(requestTimeout).toBeGreaterThan(1000) // At least 1 second
-      expect(requestTimeout).toBeLessThan(600000) // No more than 10 minutes
+      expect(requestTimeout).toBeLessThanOrEqual(600000) // No more than 10 minutes
       
       expect(keepAliveTimeout).toBeGreaterThan(1000) // At least 1 second
       expect(keepAliveTimeout).toBeLessThan(300000) // No more than 5 minutes

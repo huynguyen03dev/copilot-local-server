@@ -73,6 +73,8 @@ export const ChatMessage = z.object({
 
     // Log role transformation for debugging (only in development)
     if (process.env.NODE_ENV === 'development' && mappedRole !== role) {
+      // Note: Using console.debug here is intentional as this runs during Zod validation
+      // before the logger context is available. This is development-only debugging.
       console.debug(`🔄 Role normalized: "${role}" → "${mappedRole}"`)
     }
 

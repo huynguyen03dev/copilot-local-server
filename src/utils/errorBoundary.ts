@@ -4,15 +4,17 @@
  */
 
 import { logger } from './logger'
-import { 
-  APIErrorType, 
-  ErrorFactory, 
-  isAPIError, 
+import {
+  APIErrorType,
+  ErrorFactory,
+  isAPIError,
   formatErrorForLogging,
   type StreamingError,
   type NetworkError,
-  type ValidationError 
+  type ValidationError
 } from '../types/errors'
+import { ErrorResponseBuilder, ErrorContext } from './errorResponseBuilder'
+import { HTTP_STATUS } from '../constants'
 
 /**
  * Error boundary configuration

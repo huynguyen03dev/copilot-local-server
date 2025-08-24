@@ -1,5 +1,7 @@
 import type { ContentBlock, TextContent, ImageContent } from "../types"
 import { logger } from "./logger"
+import { CONTENT_CONSTANTS, SIZE_CONSTANTS } from "../constants"
+import { safeGet, safeArrayAccess, validateInput } from "./errorBoundary"
 
 /**
  * Content transformation cache for optimized processing
@@ -412,17 +414,25 @@ export class ContentTransformer {
       let imageBlocks = 0
 
       for (const block of content) {
+        if (!block || typeof block !== 'object') {
+          continue // Skip invalid blocks
+        }
+
         if (block.type === "text") {
           textBlocks++
-          totalSize += (block as TextContent).text.length
+          const textContent = block as TextContent
+          const textLength = textContent.text?.length || 0
+          totalSize += textLength
         } else if (block.type === "image_url") {
           imageBlocks++
-          totalSize += 100 // Estimated overhead for image references
+          totalSize += CONTENT_CONSTANTS.IMAGE_OVERHEAD_BYTES
         }
       }
 
-      const complexity = totalSize > 50000 || content.length > 100 ? 'complex' :
-                        totalSize > 5000 || content.length > 20 ? 'moderate' : 'simple'
+      const complexity = totalSize > CONTENT_CONSTANTS.COMPLEXITY_THRESHOLDS.COMPLEX_SIZE ||
+                        content.length > CONTENT_CONSTANTS.COMPLEXITY_THRESHOLDS.COMPLEX_BLOCKS ? 'complex' :
+                        totalSize > CONTENT_CONSTANTS.COMPLEXITY_THRESHOLDS.SIMPLE_SIZE ||
+                        content.length > CONTENT_CONSTANTS.COMPLEXITY_THRESHOLDS.SIMPLE_BLOCKS ? 'moderate' : 'simple'
 
       return {
         isValid: textBlocks > 0,

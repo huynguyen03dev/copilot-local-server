@@ -3,6 +3,8 @@
 import { CopilotAPIServer } from "./server"
 import { GitHubCopilotAuth } from "./auth"
 import { config, validateConfiguration } from "./config"
+import { logger } from "./utils/logger"
+import { sharedUtils } from "./utils/sharedUtilities"
 
 // Parse command line arguments
 const args = process.argv.slice(2)

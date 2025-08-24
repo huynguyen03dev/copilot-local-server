@@ -6,6 +6,14 @@
 import { Context, Next } from "hono"
 import { logger } from "../utils/logger"
 import { createAPIErrorResponse } from "../types/errors"
+import {
+  SIZE_CONSTANTS,
+  JSON_VALIDATION_CONSTANTS,
+  PERFORMANCE_CONSTANTS,
+  HTTP_STATUS
+} from "../constants"
+import { buildSizeLimitsConfig } from "../utils/configBuilder"
+import { RequestValidationService } from "../services/requestValidationService"
 
 /**
  * Request size limits configuration
@@ -21,10 +29,10 @@ export interface RequestSizeLimits {
  * Default request size limits
  */
 const DEFAULT_LIMITS: RequestSizeLimits = {
-  maxBodySize: 10 * 1024 * 1024, // 10MB
-  maxJsonDepth: 10,
-  maxArrayLength: 10000,
-  maxStringLength: 1024 * 1024 // 1MB
+  maxBodySize: SIZE_CONSTANTS.MAX_REQUEST_SIZE,
+  maxJsonDepth: JSON_VALIDATION_CONSTANTS.MAX_JSON_DEPTH,
+  maxArrayLength: JSON_VALIDATION_CONSTANTS.MAX_ARRAY_LENGTH,
+  maxStringLength: SIZE_CONSTANTS.MAX_STRING_LENGTH
 }
 
 /**
@@ -389,10 +397,10 @@ export function formatSize(bytes: number): string {
  * Test environment configuration with relaxed limits
  */
 export const TEST_LIMITS: RequestSizeLimits = {
-  maxBodySize: 50 * 1024 * 1024, // 50MB for testing
-  maxJsonDepth: 20,
-  maxArrayLength: 50000,
-  maxStringLength: 5 * 1024 * 1024 // 5MB
+  maxBodySize: SIZE_CONSTANTS.MAX_REQUEST_SIZE_TEST,
+  maxJsonDepth: JSON_VALIDATION_CONSTANTS.MAX_JSON_DEPTH_TEST,
+  maxArrayLength: JSON_VALIDATION_CONSTANTS.MAX_ARRAY_LENGTH_TEST,
+  maxStringLength: SIZE_CONSTANTS.MAX_STRING_LENGTH_TEST
 }
 
 /**
@@ -403,4 +411,53 @@ export const PRODUCTION_LIMITS: RequestSizeLimits = {
   maxJsonDepth: 8,
   maxArrayLength: 5000,
   maxStringLength: 512 * 1024 // 512KB
+}
+
+/**
+ * Enhanced request size middleware using validation service
+ */
+export function createRequestSizeMiddleware(customLimits?: Partial<RequestSizeLimits>) {
+  const validationService = new RequestValidationService(customLimits)
+
+  return async (c: Context, next: Next) => {
+    try {
+      // Get content length
+      const contentLength = c.req.header("content-length")
+      if (!contentLength) {
+        logger.warn('REQUEST_SIZE', 'Missing Content-Length header')
+        return c.json(createAPIErrorResponse(
+          "Content-Length header is required",
+          "invalid_request_error",
+          "MISSING_CONTENT_LENGTH"
+        ), HTTP_STATUS.BAD_REQUEST)
+      }
+
+      // Validate content length using service
+      const contentLengthResult = validationService.validateContentLength(contentLength)
+      if (!contentLengthResult.success) {
+        return c.json(contentLengthResult.errorResponse, contentLengthResult.statusCode)
+      }
+
+      // Get and validate request body
+      const body = await c.req.text()
+      const validationResult = await validationService.validateRequestBody(body)
+
+      if (!validationResult.success) {
+        return c.json(validationResult.errorResponse, validationResult.statusCode)
+      }
+
+      // Store parsed body for downstream use
+      c.set('parsedBody', validationResult.parsedBody)
+      c.set('bodySize', validationResult.bodySize)
+
+      await next()
+    } catch (error) {
+      logger.error('REQUEST_SIZE', `Middleware error: ${error}`)
+      return c.json(createAPIErrorResponse(
+        "Request validation failed",
+        "internal_error",
+        "VALIDATION_ERROR"
+      ), HTTP_STATUS.INTERNAL_SERVER_ERROR)
+    }
+  }
 }
